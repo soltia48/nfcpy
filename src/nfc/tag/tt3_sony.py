@@ -673,7 +673,7 @@ class FelicaStandard(tt3.Type3Tag):
         ]
         
         length = 2 + len(payload) + BLOCK_SIZE
-        x = length.to_bytes(2, "little") + cmd_code.to_bytes(1, "little") + b"\x00" * 5
+        x = length.to_bytes(1, "little") + cmd_code.to_bytes(1, "little") + b"\x00" * 6
         
         for block in blocks:
             x = CryptoUtils.encrypt_des(x, block)
