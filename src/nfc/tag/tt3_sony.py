@@ -36,7 +36,6 @@ log = logging.getLogger(__name__)
 # Constants
 DEFAULT_SYSTEM_CODE = "FFFF"
 DEFAULT_DEVICE = "usb"
-DEFAULT_TIMEOUT = 1.0
 BLOCK_SIZE = 8
 DATA_BLOCK_SIZE = 16
 IV_ZEROS = b"\x00" * BLOCK_SIZE
@@ -489,35 +488,6 @@ class FelicaStandard(tt3.Type3Tag):
             raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
         return [unpack(">H", data[i:i+2])[0] for i in range(1, len(data), 2)]
 
-    def _exchange_command(self, cmd_code: int, cmd_data: bytes) -> bytes:
-        """
-        Exchange command with card and return response data.
-        
-        Args:
-            cmd_code: Command code
-            cmd_data: Command data payload
-            
-        Returns:
-            Response data (without length and status bytes)
-        """
-        try:
-            response = self.send_cmd_recv_rsp(cmd_code, cmd_data, DEFAULT_TIMEOUT, 
-                                            send_idm=True, check_status=False)
-            
-            if len(response) < 2:
-                raise tt3.Type3TagCommandError(0x100C)  # Invalid response format
-                
-            # Check status
-            if response[0] != STATUS_SUCCESS:
-                raise tt3.Type3TagCommandError(0x1002)  # Card operation error
-                
-            return response[1:]
-            
-        except Exception as e:
-            if isinstance(e, tt3.Type3TagCommandError):
-                raise
-            raise tt3.Type3TagCommandError(0x100B)  # Command exchange failed
-
     def _check_packet_mac(self, data: bytes) -> bool:
         """
         Verify packet MAC (placeholder implementation).
@@ -551,6 +521,9 @@ class FelicaStandard(tt3.Type3Tag):
             Tuple of (issue_id_hex, issue_parameter_hex)
         """
         try:
+            a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+            timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
+
             # Generate random challenge
             random_1 = random.randbytes(BLOCK_SIZE)
             
@@ -565,7 +538,7 @@ class FelicaStandard(tt3.Type3Tag):
             auth1_cmd = self._build_auth1_command(areas, services, challenge_1A)
             
             # Execute first authentication
-            auth1_rsp = self._exchange_command(CMD_AUTH1, auth1_cmd)
+            auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, timeout, send_idm=False)
             
             # Process authentication response
             challenge_1B = auth1_rsp[8:16]
@@ -582,7 +555,7 @@ class FelicaStandard(tt3.Type3Tag):
             
             # Execute second authentication
             auth2_cmd = self.manufacture_id + challenge_2B
-            auth2_rsp = self._exchange_command(CMD_AUTH2, auth2_cmd)
+            auth2_rsp = self.send_cmd_recv_rsp(CMD_AUTH2, auth2_cmd, timeout, send_idm=False)
             
             # Process final authentication response
             return self._process_auth2_response(auth2_rsp, random_1, random_2)
@@ -675,7 +648,9 @@ class FelicaStandard(tt3.Type3Tag):
         
         # Encrypt and send
         encrypted_data = CryptoUtils.encrypt_des(payload_with_mac, self.transaction_key)
-        encrypted_response = self._exchange_command(cmd_code, encrypted_data)
+        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
+        encrypted_response = self.send_cmd_recv_rsp(cmd_code, encrypted_data, timeout, send_idm=False)
         
         # Decrypt response
         response = CryptoUtils.decrypt_des(encrypted_response, self.transaction_key)
