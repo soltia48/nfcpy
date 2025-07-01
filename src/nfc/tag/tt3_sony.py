@@ -866,14 +866,14 @@ class FelicaStandard(tt3.Type3Tag):
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
-                raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
+                raise tt3.Type3TagCommandError(0x1009)  # Register issue ID failed
                 
             return int.from_bytes(response[2:4], "little")
             
         except Exception as e:
             if isinstance(e, tt3.Type3TagCommandError):
                 raise
-            raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
+            raise tt3.Type3TagCommandError(0x1009)  # Register issue ID failed
 
     def register_area(
         self,
