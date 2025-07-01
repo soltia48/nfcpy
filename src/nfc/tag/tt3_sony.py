@@ -210,8 +210,8 @@ class FelicaStandard(tt3.Type3Tag):
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
         
-        self.manufacture_id: bytes = target.sensf_res[1:9]  # Same as idm
-        self.manufacture_parameter: bytes = target.sensf_res[9:17]  # Same as pmm
+        self.manufacture_id: bytes = bytes(target.sensf_res[1:9])  # Same as idm
+        self.manufacture_parameter: bytes = bytes(target.sensf_res[9:17])  # Same as pmm
         self.transaction_id: bytes = b""
         self.transaction_key: bytes = b""
         self.transaction_number: int = 0
