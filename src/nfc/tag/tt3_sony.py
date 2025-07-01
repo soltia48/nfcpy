@@ -33,7 +33,7 @@ import itertools
 import logging
 log = logging.getLogger(__name__)
 
-# Constants for StandardCard functionality
+# Constants
 DEFAULT_SYSTEM_CODE = "FFFF"
 DEFAULT_DEVICE = "usb"
 DEFAULT_TIMEOUT = 1.0
@@ -43,7 +43,7 @@ IV_ZEROS = b"\x00" * BLOCK_SIZE
 XOR_MASK = b"\xff" * BLOCK_SIZE
 PADDING_BLOCK_SIZE = 6
 
-# Command codes for StandardCard
+# Command codes
 CMD_AUTH1 = 0x10
 CMD_AUTH2 = 0x12
 CMD_READ = 0x14
@@ -211,7 +211,6 @@ class FelicaStandard(tt3.Type3Tag):
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
         
-        # StandardCard functionality attributes
         self.manufacture_id: bytes = target.sensf_res[1:9]  # Same as idm
         self.manufacture_parameter: bytes = target.sensf_res[9:17]  # Same as pmm
         self.transaction_id: bytes = b""
