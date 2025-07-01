@@ -549,9 +549,6 @@ class FelicaStandard(tt3.Type3Tag):
             Tuple of (issue_id_hex, issue_parameter_hex)
         """
         try:
-            a, e = self.pmm[3] & 7, self.pmm[3] >> 6
-            timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
-
             # Generate random challenge
             random_1 = random.randbytes(BLOCK_SIZE)
             
@@ -566,7 +563,9 @@ class FelicaStandard(tt3.Type3Tag):
             auth1_cmd = self._build_auth1_command(areas, services, challenge_1A)
             
             # Execute first authentication
-            auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, timeout, send_idm=False)
+            a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
+            auth1_timeout = 302E-6 * ((b + 1) * len(areas) + len(services) + a + 1) * 4**e
+            auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, auth1_timeout, send_idm=False)
             
             # Process authentication response
             challenge_1B = auth1_rsp[8:16]
@@ -583,7 +582,9 @@ class FelicaStandard(tt3.Type3Tag):
             
             # Execute second authentication
             auth2_cmd = self.manufacture_id + challenge_2B
-            auth2_rsp = self.send_cmd_recv_rsp(CMD_AUTH2, auth2_cmd, timeout, send_idm=False)
+            a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
+            auth2_timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
+            auth2_rsp = self.send_cmd_recv_rsp(CMD_AUTH2, auth2_cmd, auth2_timeout, send_idm=False)
             
             # Process final authentication response
             return self._process_auth2_response(auth2_rsp, random_1, random_2)
@@ -641,7 +642,7 @@ class FelicaStandard(tt3.Type3Tag):
         
         return issue_id.hex(), issue_parameter.hex()
 
-    def _encryption_exchange(self, cmd_code: int, data: bytes) -> bytes:
+    def _encryption_exchange(self, cmd_code: int, data: bytes, timeout: float) -> bytes:
         """
         Perform encrypted command exchange.
         
@@ -676,8 +677,6 @@ class FelicaStandard(tt3.Type3Tag):
         
         # Encrypt and send
         encrypted_data = CryptoUtils.encrypt_des(payload_with_mac, self.transaction_key)
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
-        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         encrypted_response = self.send_cmd_recv_rsp(cmd_code, encrypted_data, timeout, send_idm=False)
         
         # Decrypt response
@@ -755,9 +754,11 @@ class FelicaStandard(tt3.Type3Tag):
             raise ValueError("Elements list cannot be empty")
             
         cmd = len(elements).to_bytes(1, "little") + self._elements_to_bytes(elements)
-        
+        a, b, e = self.pmm[3] & 7, self.pmm[3] >> 3 & 7, self.pmm[3] >> 6
+        timeout = 302E-6 * ((b + 1) * len(elements) + a + 1) * 4**e
+
         try:
-            response = self._encryption_exchange(CMD_READ, cmd)
+            response = self._encryption_exchange(CMD_READ, cmd, timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
@@ -800,9 +801,12 @@ class FelicaStandard(tt3.Type3Tag):
         
         for data in elements_data.values():
             cmd += data
+
+        a, b, e = self.pmm[3] & 7, self.pmm[3] >> 3 & 7, self.pmm[3] >> 6
+        timeout = 302E-6 * ((b + 1) * len(elements_data) + a + 1) * 4**e
             
         try:
-            response = self._encryption_exchange(CMD_WRITE, cmd)
+            response = self._encryption_exchange(CMD_WRITE, cmd, timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
@@ -854,9 +858,11 @@ class FelicaStandard(tt3.Type3Tag):
         
         package = KeyManager.generate_package(package_plain, package_key)
         cmd = issue_id + issue_parameter + package
-        
+        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
+
         try:
-            response = self._encryption_exchange(CMD_REGISTER_ISSUE_ID, cmd)
+            response = self._encryption_exchange(CMD_REGISTER_ISSUE_ID, cmd, timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
@@ -898,9 +904,11 @@ class FelicaStandard(tt3.Type3Tag):
         payload = (
             area_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
         )
+        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         
         try:
-            response = self._encryption_exchange(CMD_REGISTER_AREA, payload)
+            response = self._encryption_exchange(CMD_REGISTER_AREA, payload, timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
@@ -935,9 +943,11 @@ class FelicaStandard(tt3.Type3Tag):
         payload = (
             service_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
         )
+        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         
         try:
-            response = self._encryption_exchange(CMD_REGISTER_SERVICE, payload)
+            response = self._encryption_exchange(CMD_REGISTER_SERVICE, payload, timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
@@ -952,8 +962,10 @@ class FelicaStandard(tt3.Type3Tag):
 
     def commit_registration(self) -> None:
         """Commit all pending registrations."""
+        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         try:
-            response = self._encryption_exchange(CMD_COMMIT_REGISTRATION, b"")
+            response = self._encryption_exchange(CMD_COMMIT_REGISTRATION, b"", timeout)
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
