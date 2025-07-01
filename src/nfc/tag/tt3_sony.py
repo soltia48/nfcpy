@@ -34,8 +34,6 @@ import logging
 log = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_SYSTEM_CODE = "FFFF"
-DEFAULT_DEVICE = "usb"
 BLOCK_SIZE = 8
 DATA_BLOCK_SIZE = 16
 IV_ZEROS = b"\x00" * BLOCK_SIZE
