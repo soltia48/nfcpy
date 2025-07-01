@@ -51,19 +51,12 @@ class Type3TagCommandError(nfc.tag.TagCommandError):
         # FeliCa Standard specific error codes
         0x1001: "Authentication failed",
         0x1002: "Card operation error",
-        0x1003: "Cryptographic operation failed",
-        0x1004: "Key management error",
-        0x1005: "Transaction error",
-        0x1006: "MAC verification failed",
-        0x1007: "Invalid key version",
-        0x1008: "Transaction number overflow",
-        0x1009: "Device setup failed",
-        0x100A: "Card detection failed",
-        0x100B: "Command exchange failed",
-        0x100C: "Invalid response format",
-        0x100D: "Package generation failed",
-        0x100E: "Service registration failed",
-        0x100F: "Area registration failed",
+        0x1003: "Transaction error",
+        0x1004: "MAC verification failed",
+        0x1005: "Transaction number overflow",
+        0x1006: "Invalid response format",
+        0x1007: "Service registration failed",
+        0x1008: "Area registration failed",
     }
 
 

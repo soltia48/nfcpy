@@ -625,7 +625,7 @@ class FelicaStandard(tt3.Type3Tag):
         
         # Verify MAC
         if not self._check_packet_mac(rsp_plain, CMD_AUTH2 + 1):
-            raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+            raise tt3.Type3TagCommandError(0x1004)  # MAC verification failed
             
         # Extract transaction number and verify transaction ID
         self.transaction_number = int.from_bytes(rsp_plain[0:2], "little")
@@ -658,7 +658,7 @@ class FelicaStandard(tt3.Type3Tag):
         self.transaction_number += 1
         
         if self.transaction_number >= 0xFFFF:
-            raise tt3.Type3TagCommandError(0x1008)  # Transaction number overflow
+            raise tt3.Type3TagCommandError(0x1005)  # Transaction number overflow
             
         # Prepare data with transaction info
         payload = (
@@ -713,16 +713,16 @@ class FelicaStandard(tt3.Type3Tag):
         try:
             # MAC verification for encrypted responses with command code context
             if not self._check_packet_mac(response, cmd_code + 1):
-                raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+                raise tt3.Type3TagCommandError(0x1004)  # MAC verification failed
                 
             # Verify transaction number
             response_number = int.from_bytes(response[0:2], "little")
             if response_number <= self.transaction_number:
-                raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+                raise tt3.Type3TagCommandError(0x1003)  # Transaction error
                 
             # Verify transaction ID
             if response[2:8] != self.transaction_id:
-                raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+                raise tt3.Type3TagCommandError(0x1003)  # Transaction error
                 
             self.transaction_number = response_number
             return response[8:]
@@ -730,7 +730,7 @@ class FelicaStandard(tt3.Type3Tag):
         except Exception as e:
             if isinstance(e, tt3.Type3TagCommandError):
                 raise
-            raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+            raise tt3.Type3TagCommandError(0x1004)  # MAC verification failed
 
     def _elements_to_bytes(self, elements: list[tuple[int, int]]) -> bytes:
         """Convert element list to byte representation."""
@@ -764,7 +764,7 @@ class FelicaStandard(tt3.Type3Tag):
                 raise tt3.Type3TagCommandError(0x1002)  # Card operation error
                 
             if response[2] != len(elements):
-                raise tt3.Type3TagCommandError(0x100C)  # Invalid response format
+                raise tt3.Type3TagCommandError(0x1006)  # Invalid response format
                 
             block_data = response[3:]
             return [
@@ -860,14 +860,14 @@ class FelicaStandard(tt3.Type3Tag):
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
-                raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+                raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
                 
             return int.from_bytes(response[2:4], "little")
             
         except Exception as e:
             if isinstance(e, tt3.Type3TagCommandError):
                 raise
-            raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+            raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
 
     def register_area(
         self,
@@ -904,12 +904,12 @@ class FelicaStandard(tt3.Type3Tag):
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
-                raise tt3.Type3TagCommandError(0x100F)  # Area registration failed
+                raise tt3.Type3TagCommandError(0x1008)  # Area registration failed
                 
         except Exception as e:
             if isinstance(e, tt3.Type3TagCommandError):
                 raise
-            raise tt3.Type3TagCommandError(0x100F)  # Area registration failed
+            raise tt3.Type3TagCommandError(0x1008)  # Area registration failed
 
     def register_service(
         self,
@@ -941,14 +941,14 @@ class FelicaStandard(tt3.Type3Tag):
             
             status_flag1, status_flag2 = response[0], response[1]
             if status_flag1 != STATUS_SUCCESS:
-                raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+                raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
                 
             return int.from_bytes(response[2:4], "little")
             
         except Exception as e:
             if isinstance(e, tt3.Type3TagCommandError):
                 raise
-            raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+            raise tt3.Type3TagCommandError(0x1007)  # Service registration failed
 
     def commit_registration(self) -> None:
         """Commit all pending registrations."""
