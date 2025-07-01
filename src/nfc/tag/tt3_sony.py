@@ -24,13 +24,148 @@ from . import tt3
 
 import os
 import struct
+import random
 from binascii import hexlify
-from pyDes import triple_des, CBC
+from pyDes import triple_des, CBC, des
 from struct import pack, unpack
 import itertools
 
 import logging
 log = logging.getLogger(__name__)
+
+# Constants for StandardCard functionality
+DEFAULT_SYSTEM_CODE = "FFFF"
+DEFAULT_DEVICE = "usb"
+DEFAULT_TIMEOUT = 1.0
+BLOCK_SIZE = 8
+DATA_BLOCK_SIZE = 16
+IV_ZEROS = b"\x00" * BLOCK_SIZE
+XOR_MASK = b"\xff" * BLOCK_SIZE
+PADDING_BLOCK_SIZE = 6
+
+# Command codes for StandardCard
+CMD_AUTH1 = 0x10
+CMD_AUTH2 = 0x12
+CMD_READ = 0x14
+CMD_WRITE = 0x16
+CMD_REGISTER_ISSUE_ID = 0x80
+CMD_REGISTER_AREA = 0x82
+CMD_REGISTER_SERVICE = 0x84
+CMD_COMMIT_REGISTRATION = 0x8E
+
+# Status codes
+STATUS_SUCCESS = 0x00
+
+
+class CryptoUtils:
+    """Utility class for cryptographic operations."""
+
+    @staticmethod
+    def _normalize_result(result: bytes | str) -> bytes:
+        """Normalize encryption/decryption result to bytes."""
+        if isinstance(result, bytes):
+            return result
+        elif isinstance(result, str):
+            return result.encode("latin-1")
+        else:
+            return bytes(result)
+
+    @staticmethod
+    def encrypt_des(data: bytes, key: bytes) -> bytes:
+        """Encrypt data using DES in CBC mode."""
+        cipher = des(key, mode=CBC, IV=IV_ZEROS)
+        result = cipher.encrypt(data)
+        return CryptoUtils._normalize_result(result)
+
+    @staticmethod
+    def decrypt_des(data: bytes, key: bytes) -> bytes:
+        """Decrypt data using DES in CBC mode."""
+        cipher = des(key, mode=CBC, IV=IV_ZEROS)
+        result = cipher.decrypt(data)
+        return CryptoUtils._normalize_result(result)
+
+    @staticmethod
+    def encrypt_3des(data: bytes, key1: bytes, key2: bytes) -> bytes:
+        """Encrypt data using 3DES with two keys."""
+        triple_key = key1 + key2 + key1
+        cipher = triple_des(triple_key)
+        result = cipher.encrypt(data)
+        return CryptoUtils._normalize_result(result)
+
+    @staticmethod
+    def decrypt_3des(data: bytes, key1: bytes, key2: bytes) -> bytes:
+        """Decrypt data using 3DES with two keys."""
+        triple_key = key1 + key2 + key1
+        cipher = triple_des(triple_key)
+        result = cipher.decrypt(data)
+        return CryptoUtils._normalize_result(result)
+
+    @staticmethod
+    def xor_bytes(a: bytes, b: bytes) -> bytes:
+        """XOR two byte arrays of equal length."""
+        if len(a) != len(b):
+            raise ValueError(f"Byte arrays must be equal length: {len(a)} != {len(b)}")
+        return bytes(x ^ y for x, y in zip(a, b))
+
+
+class KeyManager:
+    """Manages key generation and derivation."""
+
+    @staticmethod
+    def generate_service_keys(
+        system_key: bytes, area_keys: list[bytes], service_keys: list[bytes]
+    ) -> tuple[bytes, bytes]:
+        """
+        Generate Group Service Key (GSK) and User Service Key (USK).
+
+        Args:
+            system_key: Base system key
+            area_keys: List of area keys for encryption chain
+            service_keys: List of service keys for encryption chain
+
+        Returns:
+            Tuple of (group_service_key, user_service_key)
+        """
+        current_key = system_key
+
+        # Apply area keys
+        for area_key in area_keys:
+            current_key = CryptoUtils.encrypt_des(current_key, area_key)
+
+        group_service_key = current_key
+
+        # Apply service keys
+        for service_key in service_keys:
+            current_key = CryptoUtils.encrypt_des(current_key, service_key)
+
+        user_service_key = current_key
+
+        return group_service_key, user_service_key
+
+    @staticmethod
+    def generate_package(package_plain: bytes, package_key: bytes) -> bytes:
+        """
+        Generate encrypted package with MAC.
+
+        Args:
+            package_plain: Plain package data
+            package_key: Key for package encryption
+
+        Returns:
+            Encrypted package with MAC
+        """
+        if len(package_plain) % BLOCK_SIZE != 0:
+            raise ValueError(f"Package data must be multiple of {BLOCK_SIZE} bytes")
+
+        # Generate MAC
+        mac_key = CryptoUtils.xor_bytes(package_key, XOR_MASK)
+        mac = CryptoUtils.encrypt_des(package_plain, mac_key)[-BLOCK_SIZE:]
+
+        # Encrypt package with MAC
+        package_with_mac = package_plain + mac
+        encrypted_package = CryptoUtils.encrypt_des(package_with_mac, package_key)
+
+        return encrypted_package
 
 
 def activate(clf, target):
@@ -55,7 +190,6 @@ class FelicaStandard(tt3.Type3Tag):
     services on the same card. Services can individually be protected
     with a card key and all communication with protected services is
     encrypted.
-
     """
     IC_CODE_MAP = {
         # IC    IC-NAME    NBR NBW
@@ -76,6 +210,14 @@ class FelicaStandard(tt3.Type3Tag):
         super(FelicaStandard, self).__init__(clf, target)
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
+        
+        # StandardCard functionality attributes
+        self.manufacture_id: bytes = target.sensf_res[1:9]  # Same as idm
+        self.manufacture_parameter: bytes = target.sensf_res[9:17]  # Same as pmm
+        self.transaction_id: bytes = b""
+        self.transaction_key: bytes = b""
+        self.transaction_number: int = 0
+        self._authenticated_standard: bool = False
 
     def _is_present(self):
         # Perform a presence check. Modern FeliCa cards implement the
@@ -347,6 +489,478 @@ class FelicaStandard(tt3.Type3Tag):
             log.debug("insufficient data received from tag")
             raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
         return [unpack(">H", data[i:i+2])[0] for i in range(1, len(data), 2)]
+
+    def _exchange_command(self, cmd_code: int, cmd_data: bytes) -> bytes:
+        """
+        Exchange command with card and return response data.
+        
+        Args:
+            cmd_code: Command code
+            cmd_data: Command data payload
+            
+        Returns:
+            Response data (without length and status bytes)
+        """
+        try:
+            response = self.send_cmd_recv_rsp(cmd_code, cmd_data, DEFAULT_TIMEOUT, 
+                                            send_idm=True, check_status=False)
+            
+            if len(response) < 2:
+                raise tt3.Type3TagCommandError(0x100C)  # Invalid response format
+                
+            # Check status
+            if response[0] != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+                
+            return response[1:]
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x100B)  # Command exchange failed
+
+    def _check_packet_mac(self, data: bytes) -> bool:
+        """
+        Verify packet MAC (placeholder implementation).
+        
+        Args:
+            data: Data to verify
+            
+        Returns:
+            True if MAC is valid
+        """
+        # TODO: Implement proper MAC verification
+        return True
+
+    def mutual_authentication(
+        self,
+        areas: list[int],
+        services: list[int], 
+        group_service_key: bytes,
+        user_service_key: bytes,
+    ) -> tuple[str, str]:
+        """
+        Perform mutual authentication with the card.
+        
+        Args:
+            areas: List of area codes
+            services: List of service codes
+            group_service_key: Group service key
+            user_service_key: User service key
+            
+        Returns:
+            Tuple of (issue_id_hex, issue_parameter_hex)
+        """
+        try:
+            # Generate random challenge
+            random_1 = random.randbytes(BLOCK_SIZE)
+            
+            # Calculate authentication parameters
+            L = CryptoUtils.xor_bytes(group_service_key, self.manufacture_id)
+            alpha = CryptoUtils.encrypt_des(user_service_key, L)
+            beta = CryptoUtils.encrypt_des(L, alpha)
+            
+            challenge_1A = CryptoUtils.encrypt_3des(random_1, alpha, L)
+            
+            # Build authentication command
+            auth1_cmd = self._build_auth1_command(areas, services, challenge_1A)
+            
+            # Execute first authentication
+            auth1_rsp = self._exchange_command(CMD_AUTH1, auth1_cmd)
+            
+            # Process authentication response
+            challenge_1B = auth1_rsp[8:16]
+            challenge_2A = auth1_rsp[16:24]
+            
+            # Verify challenge response
+            expected_1B = CryptoUtils.encrypt_3des(random_1, L, beta)
+            if expected_1B != challenge_1B:
+                raise tt3.Type3TagCommandError(0x1001)  # Authentication failed
+                
+            # Generate second challenge response
+            random_2 = CryptoUtils.decrypt_3des(challenge_2A, L, beta)
+            challenge_2B = CryptoUtils.encrypt_3des(random_2, alpha, L)
+            
+            # Execute second authentication
+            auth2_cmd = self.manufacture_id + challenge_2B
+            auth2_rsp = self._exchange_command(CMD_AUTH2, auth2_cmd)
+            
+            # Process final authentication response
+            return self._process_auth2_response(auth2_rsp, random_1, random_2)
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x1001)  # Authentication failed
+
+    def _build_auth1_command(
+        self, areas: list[int], services: list[int], challenge_1A: bytes
+    ) -> bytes:
+        """Build authentication command 1."""
+        cmd = self.manufacture_id
+        
+        # Add areas
+        cmd += len(areas).to_bytes(1, "little")
+        for area in areas:
+            cmd += area.to_bytes(2, "little")
+            
+        # Add services
+        cmd += len(services).to_bytes(1, "little")
+        for service in services:
+            cmd += service.to_bytes(2, "little")
+            
+        cmd += challenge_1A
+        return cmd
+
+    def _process_auth2_response(
+        self, auth2_rsp: bytes, random_1: bytes, random_2: bytes
+    ) -> tuple[str, str]:
+        """Process authentication 2 response."""
+        # Set transaction parameters
+        self.transaction_id = random_1[2:]
+        self.transaction_key = random_2
+        
+        # Decrypt response
+        rsp_plain = CryptoUtils.decrypt_des(auth2_rsp, self.transaction_key)
+        
+        # Verify MAC
+        if not self._check_packet_mac(rsp_plain):
+            raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+            
+        # Extract transaction number and verify transaction ID
+        self.transaction_number = int.from_bytes(rsp_plain[0:2], "little")
+        
+        if rsp_plain[2:8] != self.transaction_id:
+            raise tt3.Type3TagCommandError(0x1001)  # Authentication failed
+            
+        # Extract issue information
+        issue_id = rsp_plain[8:16]
+        issue_parameter = rsp_plain[16:24]
+        
+        self._authenticated_standard = True
+        
+        return issue_id.hex(), issue_parameter.hex()
+
+    def _encryption_exchange(self, cmd_code: int, data: bytes) -> bytes:
+        """
+        Perform encrypted command exchange.
+        
+        Args:
+            cmd_code: Command code
+            data: Data payload
+            
+        Returns:
+            Decrypted response data
+        """
+        if not self._authenticated_standard:
+            raise tt3.Type3TagCommandError(0x1001)  # Authentication required
+            
+        self.transaction_number += 1
+        
+        if self.transaction_number >= 0xFFFF:
+            raise tt3.Type3TagCommandError(0x1008)  # Transaction number overflow
+            
+        # Prepare data with transaction info
+        payload = (
+            self.transaction_number.to_bytes(2, "little") + 
+            self.transaction_id + 
+            data
+        )
+        
+        # Add padding if necessary
+        payload = self._add_padding(payload)
+        
+        # Calculate MAC
+        mac = self._calculate_command_mac(cmd_code, payload)
+        payload_with_mac = payload + mac
+        
+        # Encrypt and send
+        encrypted_data = CryptoUtils.encrypt_des(payload_with_mac, self.transaction_key)
+        encrypted_response = self._exchange_command(cmd_code, encrypted_data)
+        
+        # Decrypt response
+        response = CryptoUtils.decrypt_des(encrypted_response, self.transaction_key)
+        
+        # Verify response
+        return self._verify_encrypted_response(response)
+
+    def _add_padding(self, data: bytes) -> bytes:
+        """Add PKCS#7 padding to data."""
+        if len(data) % BLOCK_SIZE == 0:
+            return data
+            
+        pad_len = BLOCK_SIZE - (len(data) % BLOCK_SIZE)
+        return data + bytes([pad_len] * pad_len)
+
+    def _calculate_command_mac(self, cmd_code: int, payload: bytes) -> bytes:
+        """Calculate MAC for command."""
+        blocks = [
+            payload[i : i + BLOCK_SIZE] for i in range(0, len(payload), BLOCK_SIZE)
+        ]
+        
+        length = 2 + len(payload) + BLOCK_SIZE
+        x = length.to_bytes(2, "little") + cmd_code.to_bytes(1, "little") + b"\x00" * 5
+        
+        for block in blocks:
+            x = CryptoUtils.encrypt_des(x, block)
+            
+        return x
+
+    def _verify_encrypted_response(self, response: bytes) -> bytes:
+        """Verify and process encrypted response."""
+        if not self._check_packet_mac(response):
+            raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+            
+        # Verify transaction number
+        response_number = int.from_bytes(response[0:2], "little")
+        if response_number <= self.transaction_number:
+            raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+            
+        # Verify transaction ID
+        if response[2:8] != self.transaction_id:
+            raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+            
+        self.transaction_number = response_number
+        return response[8:]
+
+    def _elements_to_bytes(self, elements: list[tuple[int, int]]) -> bytes:
+        """Convert element list to byte representation."""
+        result = b""
+        for index, number in elements:
+            if index >= 16:
+                raise ValueError(f"Element index must be < 16, got {index}")
+            result += (0x80 | index).to_bytes(1, "little") + number.to_bytes(1, "little")
+        return result
+
+    def read_blocks(self, elements: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read data blocks from card.
+        
+        Args:
+            elements: List of (service_index, block_number) tuples
+            
+        Returns:
+            List of 16-byte data blocks
+        """
+        if not elements:
+            raise ValueError("Elements list cannot be empty")
+            
+        cmd = len(elements).to_bytes(1, "little") + self._elements_to_bytes(elements)
+        
+        try:
+            response = self._encryption_exchange(CMD_READ, cmd)
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+                
+            if response[2] != len(elements):
+                raise tt3.Type3TagCommandError(0x100C)  # Invalid response format
+                
+            block_data = response[3:]
+            return [
+                block_data[i * DATA_BLOCK_SIZE : (i + 1) * DATA_BLOCK_SIZE]
+                for i in range(len(elements))
+            ]
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+
+    def write_blocks(self, elements_data: dict[tuple[int, int], bytes]) -> None:
+        """
+        Write data blocks to card.
+        
+        Args:
+            elements_data: Dictionary mapping (service_index, block_number) to 16-byte data
+        """
+        if not elements_data:
+            raise ValueError("Elements data cannot be empty")
+            
+        # Validate data blocks
+        for element, data in elements_data.items():
+            if len(data) != DATA_BLOCK_SIZE:
+                raise ValueError(
+                    f"Data block must be {DATA_BLOCK_SIZE} bytes, got {len(data)}"
+                )
+                
+        # Build command
+        cmd = len(elements_data).to_bytes(1, "little")
+        cmd += self._elements_to_bytes(list(elements_data.keys()))
+        
+        for data in elements_data.values():
+            cmd += data
+            
+        try:
+            response = self._encryption_exchange(CMD_WRITE, cmd)
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+                
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+
+    def register_issue_id(
+        self,
+        system_code: str,
+        key_version: int,
+        area0_key: bytes,
+        issue_id: bytes,
+        issue_parameter: bytes,
+        package_key: bytes,
+    ) -> int:
+        """
+        Register issue ID on card.
+        
+        Args:
+            system_code: 4-character hex system code
+            key_version: Key version number
+            area0_key: 8-byte area 0 key
+            issue_id: 8-byte issue ID
+            issue_parameter: 8-byte issue parameter
+            package_key: Package encryption key
+            
+        Returns:
+            Remaining block count
+        """
+        if len(system_code) != 4:
+            raise ValueError("System code must be 4 characters")
+        if len(area0_key) != BLOCK_SIZE:
+            raise ValueError(f"Area key must be {BLOCK_SIZE} bytes")
+        if len(issue_id) != BLOCK_SIZE:
+            raise ValueError(f"Issue ID must be {BLOCK_SIZE} bytes")
+        if len(issue_parameter) != BLOCK_SIZE:
+            raise ValueError(f"Issue parameter must be {BLOCK_SIZE} bytes")
+            
+        package_plain = (
+            bytes.fromhex(system_code)
+            + key_version.to_bytes(2, "little")
+            + area0_key
+            + b"\x00" * 4
+        )
+        
+        package = KeyManager.generate_package(package_plain, package_key)
+        cmd = issue_id + issue_parameter + package
+        
+        try:
+            response = self._encryption_exchange(CMD_REGISTER_ISSUE_ID, cmd)
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+                
+            return int.from_bytes(response[2:4], "little")
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+
+    def register_area(
+        self,
+        area_code: int,
+        service_code_range: tuple[int, int],
+        size: int,
+        key_version: int,
+        area_key: bytes,
+        package_key: bytes,
+    ) -> None:
+        """Register area on card."""
+        service_code_begin, service_code_end = service_code_range
+        
+        if area_code != service_code_begin:
+            raise ValueError("Area code must match service code begin")
+        if len(area_key) != BLOCK_SIZE:
+            raise ValueError(f"Area key must be {BLOCK_SIZE} bytes")
+            
+        package_plain = (
+            service_code_begin.to_bytes(2, "little")
+            + service_code_end.to_bytes(2, "little")
+            + size.to_bytes(2, "little")
+            + key_version.to_bytes(2, "little")
+            + area_key
+        )
+        
+        package = KeyManager.generate_package(package_plain, package_key)
+        payload = (
+            area_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
+        )
+        
+        try:
+            response = self._encryption_exchange(CMD_REGISTER_AREA, payload)
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x100F)  # Area registration failed
+                
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x100F)  # Area registration failed
+
+    def register_service(
+        self,
+        service_code: int,
+        size: int,
+        key_version: int,
+        service_key: bytes,
+        package_key: bytes,
+    ) -> int:
+        """Register service on card."""
+        if len(service_key) != BLOCK_SIZE:
+            raise ValueError(f"Service key must be {BLOCK_SIZE} bytes")
+            
+        package_plain = (
+            service_code.to_bytes(2, "little")
+            + b"\x00" * 2
+            + size.to_bytes(2, "little")
+            + key_version.to_bytes(2, "little")
+            + service_key
+        )
+        
+        package = KeyManager.generate_package(package_plain, package_key)
+        payload = (
+            service_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
+        )
+        
+        try:
+            response = self._encryption_exchange(CMD_REGISTER_SERVICE, payload)
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+                
+            return int.from_bytes(response[2:4], "little")
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x100E)  # Service registration failed
+
+    def commit_registration(self) -> None:
+        """Commit all pending registrations."""
+        try:
+            response = self._encryption_exchange(CMD_COMMIT_REGISTRATION, b"")
+            
+            status_flag1, status_flag2 = response[0], response[1]
+            if status_flag1 != STATUS_SUCCESS:
+                raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+                
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
+            raise tt3.Type3TagCommandError(0x1002)  # Card operation error
+
+    def reset_authentication(self):
+        """Reset authentication state."""
+        self._authenticated_standard = False
+        self.transaction_id = b""
+        self.transaction_key = b""
+        self.transaction_number = 0
 
 
 class FelicaMobile(FelicaStandard):
