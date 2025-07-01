@@ -57,7 +57,7 @@ class Type3TagCommandError(nfc.tag.TagCommandError):
         0x1006: "Invalid response format",
         0x1007: "Service registration failed",
         0x1008: "Area registration failed",
-        0x1009: "Register issue ID",
+        0x1009: "Register issue ID failed",
     }
 
 
