@@ -488,18 +488,48 @@ class FelicaStandard(tt3.Type3Tag):
             raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
         return [unpack(">H", data[i:i+2])[0] for i in range(1, len(data), 2)]
 
-    def _check_packet_mac(self, data: bytes) -> bool:
+    def _check_packet_mac(self, data: bytes, expected_response_code: int) -> bool:
         """
-        Verify packet MAC (placeholder implementation).
+        Verify packet MAC for encrypted responses.
         
         Args:
-            data: Data to verify
+            data: Encrypted response data with MAC
+            expected_response_code: Expected response code (command_code + 1)
             
         Returns:
-            True if MAC is valid
+            True if MAC is valid, False otherwise
         """
-        # TODO: Implement proper MAC verification
-        return True
+        try:
+            if len(data) % BLOCK_SIZE != 0:
+                return False
+                
+            if len(data) < BLOCK_SIZE:
+                return False
+            
+            # Extract MAC (last 8 bytes)
+            mac = data[-BLOCK_SIZE:]
+            
+            # Split remaining data into 8-byte blocks
+            payload = data[:-BLOCK_SIZE]
+            if len(payload) == 0:
+                return False
+                
+            blocks = [payload[i:i+BLOCK_SIZE] for i in range(0, len(payload), BLOCK_SIZE)]
+            
+            # Verify MAC: decrypt in reverse order using blocks as keys
+            x = mac
+            for block in reversed(blocks):
+                x = CryptoUtils.decrypt_des(x, block)
+            
+            # For encrypted responses: x[0] = data_length + 2, x[1] = response_code
+            expected_length = len(data) + 2
+            
+            return (len(x) >= 2 and 
+                    x[0] == expected_length and 
+                    x[1] == expected_response_code)
+                    
+        except Exception:
+            return False
 
     def mutual_authentication(
         self,
@@ -596,7 +626,7 @@ class FelicaStandard(tt3.Type3Tag):
         rsp_plain = CryptoUtils.decrypt_des(auth2_rsp, self.transaction_key)
         
         # Verify MAC
-        if not self._check_packet_mac(rsp_plain):
+        if not self._check_packet_mac(rsp_plain, CMD_AUTH2 + 1):
             raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
             
         # Extract transaction number and verify transaction ID
@@ -655,8 +685,8 @@ class FelicaStandard(tt3.Type3Tag):
         # Decrypt response
         response = CryptoUtils.decrypt_des(encrypted_response, self.transaction_key)
         
-        # Verify response
-        return self._verify_encrypted_response(response)
+        # Verify response with command code context
+        return self._verify_encrypted_response(response, cmd_code)
 
     def _add_padding(self, data: bytes) -> bytes:
         """Add PKCS#7 padding to data."""
@@ -680,22 +710,29 @@ class FelicaStandard(tt3.Type3Tag):
             
         return x
 
-    def _verify_encrypted_response(self, response: bytes) -> bytes:
+    def _verify_encrypted_response(self, response: bytes, cmd_code: int) -> bytes:
         """Verify and process encrypted response."""
-        if not self._check_packet_mac(response):
+        try:
+            # MAC verification for encrypted responses with command code context
+            if not self._check_packet_mac(response, cmd_code + 1):
+                raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
+                
+            # Verify transaction number
+            response_number = int.from_bytes(response[0:2], "little")
+            if response_number <= self.transaction_number:
+                raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+                
+            # Verify transaction ID
+            if response[2:8] != self.transaction_id:
+                raise tt3.Type3TagCommandError(0x1005)  # Transaction error
+                
+            self.transaction_number = response_number
+            return response[8:]
+            
+        except Exception as e:
+            if isinstance(e, tt3.Type3TagCommandError):
+                raise
             raise tt3.Type3TagCommandError(0x1006)  # MAC verification failed
-            
-        # Verify transaction number
-        response_number = int.from_bytes(response[0:2], "little")
-        if response_number <= self.transaction_number:
-            raise tt3.Type3TagCommandError(0x1005)  # Transaction error
-            
-        # Verify transaction ID
-        if response[2:8] != self.transaction_id:
-            raise tt3.Type3TagCommandError(0x1005)  # Transaction error
-            
-        self.transaction_number = response_number
-        return response[8:]
 
     def _elements_to_bytes(self, elements: list[tuple[int, int]]) -> bytes:
         """Convert element list to byte representation."""
