@@ -564,7 +564,7 @@ class FelicaStandard(tt3.Type3Tag):
             
             # Execute first authentication
             a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
-            auth1_timeout = 302E-6 * ((b + 1) * len(areas) + len(services) + a + 1) * 4**e
+            auth1_timeout = 302E-6 * ((b + 1) * (len(areas) + len(services)) + a + 1) * 4**e
             auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, auth1_timeout, send_idm=False)
             
             # Process authentication response
