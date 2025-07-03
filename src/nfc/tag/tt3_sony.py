@@ -563,7 +563,7 @@ class FelicaStandard(tt3.Type3Tag):
             auth1_cmd = self._build_auth1_command(areas, services, challenge_1A)
             
             # Execute first authentication
-            a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
+            a, b, e = self.pmm[4] & 7, self.pmm[4] >> 3 & 7, self.pmm[4] >> 6
             auth1_timeout = 302E-6 * ((b + 1) * (len(areas) + len(services)) + a + 1) * 4**e
             auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, auth1_timeout, send_idm=False)
             
@@ -582,7 +582,7 @@ class FelicaStandard(tt3.Type3Tag):
             
             # Execute second authentication
             auth2_cmd = self.manufacture_id + challenge_2B
-            a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
+            a, b, e = self.pmm[4] & 7, self.pmm[4] >> 3 & 7, self.pmm[4] >> 6
             auth2_timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
             auth2_rsp = self.send_cmd_recv_rsp(CMD_AUTH2, auth2_cmd, auth2_timeout, send_idm=False)
             
@@ -754,7 +754,7 @@ class FelicaStandard(tt3.Type3Tag):
             raise ValueError("Elements list cannot be empty")
             
         cmd = len(elements).to_bytes(1, "little") + self._elements_to_bytes(elements)
-        a, b, e = self.pmm[3] & 7, self.pmm[3] >> 3 & 7, self.pmm[3] >> 6
+        a, b, e = self.pmm[5] & 7, self.pmm[5] >> 3 & 7, self.pmm[5] >> 6
         timeout = 302E-6 * ((b + 1) * len(elements) + a + 1) * 4**e
 
         try:
@@ -802,7 +802,7 @@ class FelicaStandard(tt3.Type3Tag):
         for data in elements_data.values():
             cmd += data
 
-        a, b, e = self.pmm[3] & 7, self.pmm[3] >> 3 & 7, self.pmm[3] >> 6
+        a, b, e = self.pmm[6] & 7, self.pmm[6] >> 3 & 7, self.pmm[6] >> 6
         timeout = 302E-6 * ((b + 1) * len(elements_data) + a + 1) * 4**e
             
         try:
@@ -858,7 +858,7 @@ class FelicaStandard(tt3.Type3Tag):
         
         package = KeyManager.generate_package(package_plain, package_key)
         cmd = issue_id + issue_parameter + package
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        a, e = self.pmm[7] & 7, self.pmm[7] >> 6
         timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
 
         try:
@@ -904,7 +904,7 @@ class FelicaStandard(tt3.Type3Tag):
         payload = (
             area_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
         )
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        a, e = self.pmm[7] & 7, self.pmm[7] >> 6
         timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         
         try:
@@ -943,7 +943,7 @@ class FelicaStandard(tt3.Type3Tag):
         payload = (
             service_code.to_bytes(2, "little") + package + b"\x06" * PADDING_BLOCK_SIZE
         )
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        a, e = self.pmm[7] & 7, self.pmm[7] >> 6
         timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         
         try:
@@ -962,7 +962,7 @@ class FelicaStandard(tt3.Type3Tag):
 
     def commit_registration(self) -> None:
         """Commit all pending registrations."""
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
+        a, e = self.pmm[7] & 7, self.pmm[7] >> 6
         timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
         try:
             response = self._encryption_exchange(CMD_COMMIT_REGISTRATION, b"", timeout)
