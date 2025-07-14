@@ -48,6 +48,16 @@ class Type3TagCommandError(nfc.tag.TagCommandError):
         0x04B1: "authentication required to read (third block in list)",
         0x08B1: "authentication required to read (fourth block in list)",
         0x02B2: "verification failure for write with mac operation",
+        # FeliCa Standard specific error codes
+        0x1001: "Authentication failed",
+        0x1002: "Card operation error",
+        0x1003: "Transaction error",
+        0x1004: "MAC verification failed",
+        0x1005: "Transaction number overflow",
+        0x1006: "Invalid response format",
+        0x1007: "Service registration failed",
+        0x1008: "Area registration failed",
+        0x1009: "Register issue ID failed",
     }
 
 
