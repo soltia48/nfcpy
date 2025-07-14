@@ -12,3 +12,4 @@ dist
 venv/
 .idea/
 .env/
+build/
