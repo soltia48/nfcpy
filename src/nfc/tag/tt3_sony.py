@@ -208,8 +208,6 @@ class FelicaStandard(tt3.Type3Tag):
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
         
-        self.manufacture_id: bytes = bytes(target.sensf_res[1:9])  # Same as idm
-        self.manufacture_parameter: bytes = bytes(target.sensf_res[9:17])  # Same as pmm
         self.transaction_id: bytes = b""
         self.transaction_key: bytes = b""
         self.transaction_number: int = 0
@@ -549,11 +547,13 @@ class FelicaStandard(tt3.Type3Tag):
             Tuple of (issue_id_hex, issue_parameter_hex)
         """
         try:
+            idm = bytes(self.idm)
+
             # Generate random challenge
             random_1 = random.randbytes(BLOCK_SIZE)
             
             # Calculate authentication parameters
-            L = CryptoUtils.xor_bytes(group_service_key, self.manufacture_id)
+            L = CryptoUtils.xor_bytes(group_service_key, idm)
             alpha = CryptoUtils.encrypt_des(user_service_key, L)
             beta = CryptoUtils.encrypt_des(L, alpha)
             
@@ -565,11 +565,11 @@ class FelicaStandard(tt3.Type3Tag):
             # Execute first authentication
             a, b, e = self.pmm[4] & 7, self.pmm[4] >> 3 & 7, self.pmm[4] >> 6
             auth1_timeout = 302E-6 * ((b + 1) * (len(areas) + len(services)) + a + 1) * 4**e
-            auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, auth1_timeout, send_idm=False)
+            auth1_rsp = self.send_cmd_recv_rsp(CMD_AUTH1, auth1_cmd, auth1_timeout, check_status=False)
             
             # Process authentication response
-            challenge_1B = auth1_rsp[8:16]
-            challenge_2A = auth1_rsp[16:24]
+            challenge_1B = auth1_rsp[0:8]
+            challenge_2A = auth1_rsp[8:16]
             
             # Verify challenge response
             expected_1B = CryptoUtils.encrypt_3des(random_1, L, beta)
@@ -581,7 +581,7 @@ class FelicaStandard(tt3.Type3Tag):
             challenge_2B = CryptoUtils.encrypt_3des(random_2, alpha, L)
             
             # Execute second authentication
-            auth2_cmd = self.manufacture_id + challenge_2B
+            auth2_cmd = idm + challenge_2B
             a, b, e = self.pmm[4] & 7, self.pmm[4] >> 3 & 7, self.pmm[4] >> 6
             auth2_timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
             auth2_rsp = self.send_cmd_recv_rsp(CMD_AUTH2, auth2_cmd, auth2_timeout, send_idm=False)
@@ -598,10 +598,8 @@ class FelicaStandard(tt3.Type3Tag):
         self, areas: list[int], services: list[int], challenge_1A: bytes
     ) -> bytes:
         """Build authentication command 1."""
-        cmd = self.manufacture_id
-        
         # Add areas
-        cmd += len(areas).to_bytes(1, "little")
+        cmd = len(areas).to_bytes(1, "little")
         for area in areas:
             cmd += area.to_bytes(2, "little")
             
