@@ -392,6 +392,52 @@ class FelicaStandard(tt3.Type3Tag):
             log.debug("insufficient data received from tag")
             raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
         return [unpack("<H", data[i:i+2])[0] for i in range(1, len(data), 2)]
+    
+    def request_service_v2(self, service_list):
+        """Verify existence of services (or areas) and get key versions with crypto support.
+
+        Each service (or area) to verify must be given as a
+        :class:`~nfc.tag.tt3.ServiceCode` in the iterable
+        *service_list*. 
+        
+        The key versions are returned as a list of tuples in the order requested.
+        For crypto_id 0x41 or 0x43 (dual crypto support), each tuple contains
+        (aes_key_version, des_key_version). For other crypto_ids, each tuple 
+        contains (key_version, None).
+        
+        If a specified service (or area) does not exist, the behavior depends
+        on the card's response format.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
+        timeout = 302E-6 * ((b + 1) * len(service_list) + a + 1) * 4**e
+        pack = lambda x: x.pack()  # noqa: E731
+        data = bytearray([len(service_list)]) \
+            + b''.join(map(pack, service_list))
+        data = self.send_cmd_recv_rsp(0x32, data, timeout, check_status=False)
+        
+        key_versions: list[tuple[int, int | None]] = []
+        st1 = data[0]
+        if st1 == 0:
+            crypto_id = data[2]
+            node_count = data[3]
+            if crypto_id == 0x41 or crypto_id == 0x43:
+                for i in range(node_count):
+                    aes_offset = 4 + i * 2
+                    des_offset = node_count * 2 + aes_offset
+                    key_versions.append(
+                        (
+                            int.from_bytes(data[aes_offset:aes_offset + 2], byteorder="little"),
+                            int.from_bytes(data[des_offset:des_offset + 2], byteorder="little"),
+                        )
+                    )
+            else:
+                for i in range(node_count):
+                    offset = 4 + i * 2
+                    key_versions.append((int.from_bytes(data[offset:offset + 2], byteorder="little"), None))
+        return key_versions
 
     def request_response(self):
         """Verify that a card is still present and get its operating mode.
