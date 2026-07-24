@@ -1107,6 +1107,13 @@ class Target(object):
             self.__dict__[name] = kwargs[name]
 
     def __getattr__(self, name):
+        # An unset target attribute reads as None, but special methods must
+        # keep raising AttributeError. Answering None for them would claim
+        # that this object implements protocols it does not, e.g. hasattr()
+        # for __await__ or __aiter__ would be True and make a Target look
+        # like a coroutine or an async iterator.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return None
 
     def __eq__(self, other):

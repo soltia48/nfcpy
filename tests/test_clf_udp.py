@@ -87,7 +87,11 @@ def device(mocker):  # noqa: F811
     yield device
     try:
         device.close()
-    except StopIteration:
+    except (StopIteration, nfc.clf.TransmissionError):
+        # Closing sends a final RFOFF. Tests that do not set up the mocked
+        # socket for that call let it run out of responses (StopIteration) or
+        # return a Mock instead of the sent byte count (TransmissionError).
+        # Neither says anything about the test itself.
         pass
 
 
