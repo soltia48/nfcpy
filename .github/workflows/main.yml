@@ -25,10 +25,18 @@ jobs:
         with:
           python-version: "${{ matrix.python-version }}"
 
+      # nfc.llcp.sec binds libcrypto.so.1.0.0 through ctypes, so the LLCP
+      # secure data transfer needs OpenSSL 1.0 at runtime. That release is
+      # end-of-life and has been removed from the Ubuntu pool, but Launchpad
+      # keeps the published binary, so the package is fetched from there.
       - name: "Install libssl 1.0"
         run: |
-          wget http://security.ubuntu.com/ubuntu/pool/main/o/openssl1.0/libssl1.0.0_1.0.2n-1ubuntu5.7_amd64.deb
+          set -xe
+          wget https://launchpad.net/ubuntu/+archive/primary/+files/libssl1.0.0_1.0.2n-1ubuntu5.7_amd64.deb
           sudo apt install ./libssl1.0.0_1.0.2n-1ubuntu5.7_amd64.deb
+          # fail early and loudly if the library did not end up in the cache,
+          # ctypes.util.find_library resolves it through ldconfig
+          ldconfig -p | grep libcrypto.so.1.0.0
 
       - name: "Install dependencies"
         run: |
