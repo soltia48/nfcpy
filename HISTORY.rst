@@ -1,6 +1,73 @@
 Changelog for nfcpy
 ===================
 
+1.1.0 (unreleased)
+------------------
+
+This release implements the FeliCa Standard proprietary command set,
+including both secure messaging schemes. It also replaces the `pyDes`
+dependency with `pycryptodome` and drops support for Python versions
+before 3.8.
+
+* The `nfc.tag.tt3_sony.FelicaStandard` class implements the proprietary
+  FeliCa Standard commands for card and file system inspection: Request
+  Block Information (Ex), Request Code List, Set Parameter, Get Container
+  Issue Information, Get Container Property, Get Container ID, Get Area
+  Information, Get Node Property, Get System Status, Request Product
+  Information, Request Specification Version, Request Service v2, and
+  Reset Mode.
+
+* Services protected by a card key can now be used. The
+  `mutual_authentication` method performs the DES Authentication1 and
+  Authentication2 exchange and opens a secure session for the `read` and
+  `write` methods. The `mutual_authentication_v2` method does the same
+  for the AES-128 scheme with `read_v2` and `write_v2`. Both sessions
+  encrypt every packet, authenticate it with a MAC, and require the
+  transaction number to advance.
+
+* The session state is exposed as an `AuthenticatedContext` through the
+  `authenticated_context`, `set_authenticated_context` and
+  `clear_authenticated_context` methods, so a session can be handed to a
+  different tag instance. The `secure_transceive` method sends an
+  arbitrary command through an open session.
+
+* Service keys are derived from a key hierarchy with the static methods
+  `generate_service_keys_des` and `generate_group_key_v2_aes128`.
+
+* Card issuance is supported with the `register_issue_id`,
+  `register_area`, `register_service` and `change_system_block` methods.
+  Service keys are rotated with `change_keys`.
+
+* The `pyDes` dependency is replaced by `pycryptodome`, which also
+  provides the AES and CMAC primitives needed for the FeliCa Standard
+  v2 secure messaging. The Mifare Ultralight C and FeliCa Lite/Lite-S
+  authentication produce byte identical results as before. A 16 byte
+  Ultralight C key whose halves are equal degenerates to single DES;
+  `pycryptodome` refuses to build a 3DES cipher for such a key, so
+  `nfc.tag.tt2_nxp.triple_des_cbc` falls back to a single DES cipher.
+
+* Python 2 is no longer supported and `python_requires` is corrected to
+  `>=3.8`, which is what the code has actually needed. The trove
+  classifiers, the CI matrix and the documentation are updated to match.
+
+* Security: The MAC of a DES secure messaging packet was only verified
+  by its leading length and command code byte. The remaining six bytes
+  of the recovered pre-image are now verified as well, which restores
+  the forgery resistance from 16 to 64 bit. MAC tags and authentication
+  challenges are compared in constant time.
+
+* Bugfix: The DES secure `write` command rejected every response. A DES
+  secure response is CBC encrypted and therefore padded to a multiple of
+  8 byte, but the decrypted status flags were required to be exactly 2
+  byte. This also affected `change_keys`, which writes through the same
+  command.
+
+* The list arguments of the FeliCa Standard commands are checked against
+  the limits of the specification before a command frame is built.
+
+* A new documentation chapter describes the FeliCa Standard commands,
+  key derivation, secure messaging and issuance.
+
 1.0.4 (2022-03-10)
 ------------------
 
