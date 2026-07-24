@@ -494,13 +494,13 @@ class Target(DataExchangeProtocol):
                 return
             if req.did == self.did:
                 if type(req) in (DSL_REQ, RLS_REQ):
-                    RES = DSL_RES if type(req) == DSL_REQ else RLS_RES
+                    RES = DSL_RES if type(req) is DSL_REQ else RLS_RES
                     try:
                         self.send_res_recv_req(RES(self.did), 0)
                     except nfc.clf.CommunicationError:
                         pass
                     return
-                if type(req) == DEP_REQ:
+                if type(req) is DEP_REQ:
                     if req.pfb.fmt == DEP_REQ.Attention:
                         res = ATN(self.did, self.nad)
                     else:
@@ -570,7 +570,8 @@ class Target(DataExchangeProtocol):
 
         res = RTOX(rtox, self.did, self.nad)
         req = self.send_dep_res_recv_dep_req(res, deadline=time.time()+1)
-        if type(req) == DEP_REQ and req.pfb.fmt == DEP_REQ.TimeoutExtension:
+        if (type(req) is DEP_REQ
+                and req.pfb.fmt == DEP_REQ.TimeoutExtension):
             return req.data[0] & 0x3F
 
     def send_dep_res_recv_dep_req(self, dep_res, deadline):
@@ -588,11 +589,11 @@ class Target(DataExchangeProtocol):
             elif req.did != self.did:
                 log.debug("ignore non-matching device identifier")
                 res = None
-            elif type(req) == DSL_REQ:
+            elif type(req) is DSL_REQ:
                 return self.send_res_recv_req(DSL_RES(self.did), 0)
-            elif type(req) == RLS_REQ:
+            elif type(req) is RLS_REQ:
                 return self.send_res_recv_req(RLS_RES(self.did), 0)
-            elif type(req) == DEP_REQ:
+            elif type(req) is DEP_REQ:
                 if req.pfb.fmt == DEP_REQ.Attention:
                     res = ATN(self.did, self.nad)
                 elif req.pfb.fmt == DEP_REQ.NegativeAck:
@@ -800,8 +801,8 @@ class DEP_REQ_RES(object):
         @property
         def type(self): return self.fmt
 
-    LastInformation, MoreInformation, PositiveAck, NegativeAck,\
-        Attention, TimeoutExtension = (0, 1, 4, 5, 8, 9)
+    (LastInformation, MoreInformation, PositiveAck, NegativeAck,
+     Attention, TimeoutExtension) = (0, 1, 4, 5, 8, 9)
 
     def __init__(self, pfb, did, nad, data):
         self.pfb, self.did, self.nad = pfb, did, nad

@@ -41,7 +41,7 @@ def clf(mocker, target):  # noqa: F811
 @pytest.fixture()
 def tag(clf, target):
     tag = nfc.tag.activate(clf, target)
-    assert type(tag) == nfc.tag.tt2.Type2Tag
+    assert type(tag) is nfc.tag.tt2.Type2Tag
     return tag
 
 

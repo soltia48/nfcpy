@@ -23,13 +23,15 @@ import nfc.tag
 from . import tt3
 
 from dataclasses import dataclass
+import hmac
 import os
 import struct
 from binascii import hexlify
 from Crypto.Cipher import AES, DES, DES3
 from Crypto.Hash import CMAC
 from struct import pack, unpack
-from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, TypedDict, Union
+from typing import (
+    Dict, List, NoReturn, Optional, Sequence, Tuple, TypedDict, Union)
 import itertools
 
 import logging
@@ -71,7 +73,8 @@ class SpecificationVersion:
         return self._option_version(2)
 
     @property
-    def value_limited_purse_service_option_version(self) -> Optional[OptionVersion]:
+    def value_limited_purse_service_option_version(
+            self) -> Optional[OptionVersion]:
         return self._option_version(3)
 
     @property
@@ -141,7 +144,8 @@ class Aes128SecureSessionCredentials:
         )
 
 
-SecureSessionCredentials = Union[DesSecureSessionCredentials, Aes128SecureSessionCredentials]
+SecureSessionCredentials = Union[
+    DesSecureSessionCredentials, Aes128SecureSessionCredentials]
 
 
 @dataclass
@@ -158,9 +162,11 @@ class AuthenticatedContext:
         self.transaction_id = bytearray(self.transaction_id)
         if len(self.transaction_id) != 6:
             raise ValueError("transaction_id must be 6 bytes")
-        if isinstance(self.credentials, (DesSecureSessionCredentials, Aes128SecureSessionCredentials)):
+        if isinstance(self.credentials, (
+                DesSecureSessionCredentials, Aes128SecureSessionCredentials)):
             return
-        raise ValueError("credentials must be DES or AES128 secure session credentials")
+        raise ValueError(
+            "credentials must be DES or AES128 secure session credentials")
 
     @property
     def scheme(self) -> SecureSessionScheme:
@@ -190,6 +196,7 @@ class ChangeKeyParam(TypedDict):
     new_key: Octets
     old_key: Octets
     new_key_version: int
+
 
 def activate(clf, target) -> Optional[tt3.Type3Tag]:
     # http://www.sony.net/Products/felica/business/tech-support/list.html
@@ -304,6 +311,14 @@ class FelicaStandard(tt3.Type3Tag):
         0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00])
 
+    # Upper bounds the specification puts on the list arguments of the
+    # commands below. Sending more entries than the card accepts produces
+    # an over-long frame, so the lists are checked before transmission.
+    MAX_SERVICE_CODES = 0x20
+    MAX_NODE_CODES = 0x20
+    MAX_NODE_PROPERTY_CODES = 0x10
+    MAX_BLOCK_LIST_LEN = 0xFF
+
     TIMEOUT_UNIT = 302E-6
     MIN_TIMEOUT = 0.002
 
@@ -311,25 +326,29 @@ class FelicaStandard(tt3.Type3Tag):
         super(FelicaStandard, self).__init__(clf, target)
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
-        self._authenticated_context = None  # type: Optional[AuthenticatedContext]
+        self._authenticated_context = \
+            None  # type: Optional[AuthenticatedContext]
 
     def _timing_params(self, pmm_slot: int) -> Tuple[int, int, int]:
         pmm_byte = self.pmm[pmm_slot]
         return pmm_byte & 7, pmm_byte >> 3 & 7, pmm_byte >> 6
 
-    def _base_timeout(self, pmm_slot: int, enforce_min: bool = False) -> float:
+    def _base_timeout(
+            self, pmm_slot: int, enforce_min: bool = False) -> float:
         a, _, e = self._timing_params(pmm_slot)
         timeout = self.TIMEOUT_UNIT * (a + 1) * 4**e
         return max(timeout, self.MIN_TIMEOUT) if enforce_min else timeout
 
     def _scaled_timeout(
-            self, pmm_slot: int, units: int, enforce_min: bool = False) -> float:
+            self, pmm_slot: int, units: int,
+            enforce_min: bool = False) -> float:
         a, b, e = self._timing_params(pmm_slot)
         timeout = self.TIMEOUT_UNIT * ((b + 1) * units + a + 1) * 4**e
         return max(timeout, self.MIN_TIMEOUT) if enforce_min else timeout
 
     def _send_standard_command(
-            self, cmd_code: int, cmd_data: Octets, timeout: float) -> bytearray:
+            self, cmd_code: int, cmd_data: Octets,
+            timeout: float) -> bytearray:
         return self.send_cmd_recv_rsp(
             cmd_code, cmd_data, timeout, check_status=False)
 
@@ -349,7 +368,8 @@ class FelicaStandard(tt3.Type3Tag):
             cls._raise_data_size_error()
 
     @staticmethod
-    def _raise_status_flag_error(status_flag1: int, status_flag2: int) -> NoReturn:
+    def _raise_status_flag_error(
+            status_flag1: int, status_flag2: int) -> NoReturn:
         log.debug("tag returned error status {0:02x}{1:02x}".format(
             status_flag1, status_flag2))
         raise tt3.Type3TagCommandError(status_flag1 << 8 | status_flag2)
@@ -366,7 +386,8 @@ class FelicaStandard(tt3.Type3Tag):
             require_status_flag2_zero: bool = False) -> Tuple[int, int]:
         status_flag1, status_flag2 = cls._parse_status_flags(
             data, min_length=min_length)
-        if status_flag1 != 0 or (require_status_flag2_zero and status_flag2 != 0):
+        if status_flag1 != 0 or (require_status_flag2_zero
+                                 and status_flag2 != 0):
             cls._raise_status_flag_error(status_flag1, status_flag2)
         return status_flag1, status_flag2
 
@@ -389,13 +410,15 @@ class FelicaStandard(tt3.Type3Tag):
         raise RuntimeError(message)
 
     def _send_without_response_idm(
-            self, cmd_code: int, cmd_data: Octets, timeout: float) -> bytearray:
+            self, cmd_code: int, cmd_data: Octets,
+            timeout: float) -> bytearray:
         return self.send_cmd_recv_rsp(
             cmd_code, cmd_data, timeout, send_idm=False, check_status=False)
 
     def _send_command_with_idm_no_idm_response(
             self, cmd_code: int, payload: Octets, timeout: float) -> bytearray:
-        return self._send_without_response_idm(cmd_code, self.idm + payload, timeout)
+        return self._send_without_response_idm(
+            cmd_code, self.idm + payload, timeout)
 
     @staticmethod
     def _to_bytes(data: Octets) -> bytes:
@@ -404,6 +427,25 @@ class FelicaStandard(tt3.Type3Tag):
     @staticmethod
     def _xor_bytes(a: Octets, b: Octets) -> bytearray:
         return bytearray([x ^ y for x, y in zip(bytearray(a), bytearray(b))])
+
+    @classmethod
+    def _ct_eq(cls, a: Octets, b: Octets) -> bool:
+        """Constant time equality for secret derived byte strings.
+
+        Used for MAC tags and challenge responses, i.e. wherever a locally
+        computed secret is compared against a value the card supplied. A
+        plain comparison returns early at the first differing byte and thus
+        tells an attacker how much of a forgery was already correct.
+
+        """
+        return hmac.compare_digest(cls._to_bytes(a), cls._to_bytes(b))
+
+    @classmethod
+    def _validate_list_length(
+            cls, name: str, length: int, minimum: int, maximum: int) -> None:
+        if not minimum <= length <= maximum:
+            raise ValueError("{0} must contain between {1} and {2} entries"
+                             .format(name, minimum, maximum))
 
     @staticmethod
     def _ceil_to_multiple(value: int, unit: int) -> int:
@@ -512,10 +554,12 @@ class FelicaStandard(tt3.Type3Tag):
     def _calculate_command_mac_des(
             cls, command_code: int, payload: Octets) -> bytearray:
         if len(payload) % 8 != 0:
-            cls._raise_protocol_error("secure command payload must be multiple of 8 bytes")
+            cls._raise_protocol_error(
+                "secure command payload must be multiple of 8 bytes")
         total_length = 2 + len(payload) + 8
         if total_length > 255:
-            cls._raise_protocol_error("secure command payload exceeds maximum frame length")
+            cls._raise_protocol_error(
+                "secure command payload exceeds maximum frame length")
         mac = bytearray(8)
         mac[0] = total_length
         mac[1] = command_code
@@ -532,7 +576,16 @@ class FelicaStandard(tt3.Type3Tag):
         x = bytearray(mac)
         for i in range(len(payload)-8, -1, -8):
             x = cls._decrypt_des_block(x, payload[i:i+8])
-        return x[0] == ((len(data) + 2) & 0xFF) and x[1] == expected_response_code
+        # The MAC pre-image built by _calculate_command_mac_des is
+        # [length, code, 0, 0, 0, 0, 0, 0], so a genuine MAC recovers all
+        # eight bytes. Checking only length and code would drop the forgery
+        # resistance from 64 to 16 bit and accept forged MACs that real
+        # FeliCa hardware rejects, thus the reserved six bytes are checked
+        # as well.
+        expected = bytearray(8)
+        expected[0] = (len(data) + 2) & 0xFF
+        expected[1] = expected_response_code
+        return cls._ct_eq(x, expected)
 
     @classmethod
     def _encrypt_secure_command_des(
@@ -545,16 +598,19 @@ class FelicaStandard(tt3.Type3Tag):
     @classmethod
     def _decrypt_secure_response_des(
             cls, response_code: int, expected_transaction_id: Octets,
-            session_key: Octets, encrypted_payload: Octets) -> Tuple[int, bytearray]:
+            session_key: Octets,
+            encrypted_payload: Octets) -> Tuple[int, bytearray]:
         plain = cls._decrypt_des_cbc_zero_iv(encrypted_payload, session_key)
         if cls._check_packet_mac_des(plain, response_code) is False:
-            cls._raise_protocol_error("secure response MAC verification failed")
+            cls._raise_protocol_error(
+                "secure response MAC verification failed")
         if len(plain) < 24:
             cls._raise_protocol_error("secure response payload too short")
         transaction_number = unpack("<H", plain[0:2])[0]
         transaction_id = plain[2:8]
         if transaction_id != expected_transaction_id:
-            cls._raise_protocol_error("secure response transaction ID mismatch")
+            cls._raise_protocol_error(
+                "secure response transaction ID mismatch")
         payload_with_pad = plain[8:-8]
         return transaction_number, payload_with_pad
 
@@ -586,14 +642,16 @@ class FelicaStandard(tt3.Type3Tag):
     @classmethod
     def _encrypt_aes128_block(cls, data: Octets, key: Octets) -> bytearray:
         if len(data) != 16 or len(key) != 16:
-            cls._raise_protocol_error("AES block encrypt requires 16-byte block and key")
+            cls._raise_protocol_error(
+                "AES block encrypt requires 16-byte block and key")
         cipher = AES.new(cls._to_bytes(key), AES.MODE_ECB)
         return bytearray(cipher.encrypt(cls._to_bytes(data)))
 
     @classmethod
     def _decrypt_aes128_block(cls, data: Octets, key: Octets) -> bytearray:
         if len(data) != 16 or len(key) != 16:
-            cls._raise_protocol_error("AES block decrypt requires 16-byte block and key")
+            cls._raise_protocol_error(
+                "AES block decrypt requires 16-byte block and key")
         cipher = AES.new(cls._to_bytes(key), AES.MODE_ECB)
         return bytearray(cipher.decrypt(cls._to_bytes(data)))
 
@@ -616,7 +674,8 @@ class FelicaStandard(tt3.Type3Tag):
             cls, encryption_key: Octets, iv: Octets, payload: Octets,
             mac: Octets) -> Tuple[bytearray, bytearray]:
         if len(encryption_key) != 16 or len(iv) != 16 or len(mac) != 8:
-            cls._raise_protocol_error("AES v2 secure payload has invalid key or IV length")
+            cls._raise_protocol_error(
+                "AES v2 secure payload has invalid key or IV length")
         stream = AES.new(
             cls._to_bytes(encryption_key), AES.MODE_OFB, iv=cls._to_bytes(iv))
         payload_out = bytearray(stream.encrypt(cls._to_bytes(payload)))
@@ -648,9 +707,11 @@ class FelicaStandard(tt3.Type3Tag):
         counter_bytes = pack("<H", transaction_number)
         frame_length = 1 + 1 + 2 + len(payload) + 8
         if frame_length > 255:
-            cls._raise_protocol_error("secure command payload exceeds maximum frame length")
+            cls._raise_protocol_error(
+                "secure command payload exceeds maximum frame length")
         iv = cls._build_initial_vector_v2_aes128(
-            frame_length, command_code, counter_bytes, transaction_id, challenge_3c)
+            frame_length, command_code, counter_bytes, transaction_id,
+            challenge_3c)
         mac = cls._calculate_mac_v2_aes128(iv, payload, mac_key)
         cipher_payload, cipher_mac = cls._crypt_payload_and_mac_v2_aes128(
             encryption_key, iv, payload, mac)
@@ -662,7 +723,8 @@ class FelicaStandard(tt3.Type3Tag):
             challenge_3c: Octets, encryption_key: Octets,
             mac_key: Octets, data: Octets) -> Tuple[int, bytearray]:
         if len(data) < 10:
-            cls._raise_protocol_error("secure response too short for AES v2 framing")
+            cls._raise_protocol_error(
+                "secure response too short for AES v2 framing")
         counter_bytes = data[0:2]
         transaction_number = unpack("<H", counter_bytes)[0]
         cipher_payload = data[2:-8]
@@ -670,14 +732,17 @@ class FelicaStandard(tt3.Type3Tag):
 
         frame_length = 2 + len(data)
         if frame_length > 255:
-            cls._raise_protocol_error("secure response exceeds maximum frame length")
+            cls._raise_protocol_error(
+                "secure response exceeds maximum frame length")
         iv = cls._build_initial_vector_v2_aes128(
-            frame_length, response_code, counter_bytes, transaction_id, challenge_3c)
+            frame_length, response_code, counter_bytes, transaction_id,
+            challenge_3c)
         payload, mac_plain = cls._crypt_payload_and_mac_v2_aes128(
             encryption_key, iv, cipher_payload, cipher_mac)
         expected_mac = cls._calculate_mac_v2_aes128(iv, payload, mac_key)
-        if mac_plain != expected_mac:
-            cls._raise_protocol_error("secure response MAC verification failed for AES v2")
+        if not cls._ct_eq(mac_plain, expected_mac):
+            cls._raise_protocol_error(
+                "secure response MAC verification failed for AES v2")
         return transaction_number, payload
 
     def _secure_command_exchange(
@@ -719,14 +784,15 @@ class FelicaStandard(tt3.Type3Tag):
 
         context = self._ensure_authenticated_context()
         if rsp_tn <= context.transaction_number:
-            self._raise_protocol_error("secure response transaction number did not advance")
+            self._raise_protocol_error(
+                "secure response transaction number did not advance")
         context.transaction_number = rsp_tn
         return response_payload
 
     def secure_transceive(
             self, command_code: int, command_payload: Octets,
             timeout: float) -> bytearray:
-        """Encrypt an arbitrary command, transceive it, and return the response.
+        """Encrypt a command, transceive it, and return the response.
 
         The *command_code* and *command_payload* are encrypted under the
         active secure session, sent to the card, and the decrypted response
@@ -910,6 +976,8 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        self._validate_list_length(
+            "service_list", len(service_list), 1, self.MAX_SERVICE_CODES)
         timeout = self._scaled_timeout(
             self.REQUEST_SERVICE_PMMSLOT, len(service_list))
         pack = lambda x: x.pack()  # noqa: E731
@@ -1020,6 +1088,8 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        self._validate_list_length(
+            "node_code_list", len(node_code_list), 1, self.MAX_NODE_CODES)
         timeout = self._scaled_timeout(
             self.REQUEST_BLOCK_INFORMATION_PMMSLOT,
             len(node_code_list), enforce_min=True)
@@ -1032,7 +1102,8 @@ class FelicaStandard(tt3.Type3Tag):
         return [unpack("<H", data[i:i+2])[0] for i in range(1, len(data), 2)]
 
     def request_block_information_ex(
-            self, node_code_list: Sequence[int]) -> Tuple[List[int], List[int]]:
+            self,
+            node_code_list: Sequence[int]) -> Tuple[List[int], List[int]]:
         """Return assigned and free block counts for node codes.
 
         The *node_code_list* argument must provide one or more
@@ -1042,6 +1113,8 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        self._validate_list_length(
+            "node_code_list", len(node_code_list), 1, self.MAX_NODE_CODES)
         timeout = self._scaled_timeout(
             self.REQUEST_BLOCK_INFORMATION_EX_PMMSLOT,
             len(node_code_list), enforce_min=True)
@@ -1082,7 +1155,8 @@ class FelicaStandard(tt3.Type3Tag):
         timeout = self._base_timeout(
             self.REQUEST_CODE_LIST_PMMSLOT, enforce_min=True)
         data = pack("<HH", parent_node_code, index)
-        data = self._send_standard_command(self.REQUEST_CODE_LIST_CMD, data, timeout)
+        data = self._send_standard_command(
+            self.REQUEST_CODE_LIST_CMD, data, timeout)
 
         self._validate_min_length(data, 2)
         status_flag1, status_flag2 = data[0], data[1]
@@ -1124,7 +1198,8 @@ class FelicaStandard(tt3.Type3Tag):
         timeout = self._base_timeout(
             self.SET_PARAMETER_PMMSLOT, enforce_min=True)
         data = bytearray([0, 0, 0, 0, encryption_type, packet_type, 0, 0])
-        data = self._send_standard_command(self.SET_PARAMETER_CMD, data, timeout)
+        data = self._send_standard_command(
+            self.SET_PARAMETER_CMD, data, timeout)
         self._validate_exact_length(data, 2)
 
         status_flag1, status_flag2 = data[0], data[1]
@@ -1156,8 +1231,8 @@ class FelicaStandard(tt3.Type3Tag):
         timeout = self._base_timeout(
             self.GET_CONTAINER_PROPERTY_PMMSLOT, enforce_min=True)
         data = self.send_cmd_recv_rsp(
-            self.GET_CONTAINER_PROPERTY_CMD, pack("<H", property_index), timeout,
-            send_idm=False, check_status=False)
+            self.GET_CONTAINER_PROPERTY_CMD, pack("<H", property_index),
+            timeout, send_idm=False, check_status=False)
         self._validate_min_length(data, 1)
         return data
 
@@ -1236,6 +1311,9 @@ class FelicaStandard(tt3.Type3Tag):
 
         version_data = data[2:]
         self._validate_min_length(version_data, 4)
+        if version_data[0] != 0x00:
+            self._raise_protocol_error(
+                "specification version format version must be 0x00")
         option_count = version_data[3]
         self._validate_exact_length(version_data, 4 + option_count * 2)
 
@@ -1305,12 +1383,16 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        self._validate_list_length(
+            "node_code_list", len(node_code_list), 1,
+            self.MAX_NODE_PROPERTY_CODES)
         timeout = self._scaled_timeout(
             self.GET_NODE_PROPERTY_PMMSLOT,
             max(1, min(len(node_code_list), 16)), enforce_min=True)
         data = bytearray([node_property_type, len(node_code_list)]) \
             + b''.join([pack("<H", x) for x in node_code_list])
-        data = self._send_standard_command(self.GET_NODE_PROPERTY_CMD, data, timeout)
+        data = self._send_standard_command(
+            self.GET_NODE_PROPERTY_CMD, data, timeout)
 
         self._validate_status_flags(data)
         self._validate_min_length(data, 3)
@@ -1319,7 +1401,8 @@ class FelicaStandard(tt3.Type3Tag):
         if node_count != len(node_code_list):
             self._raise_data_size_error()
 
-        if node_property_type == self.NODE_PROPERTY_VALUE_LIMITED_PURSE_SERVICE:
+        if (node_property_type
+                == self.NODE_PROPERTY_VALUE_LIMITED_PURSE_SERVICE):
             self._validate_exact_length(data, 3 + node_count * 10)
             properties = list()
             for i in range(node_count):
@@ -1366,13 +1449,16 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        self._validate_list_length(
+            "service_list", len(service_list), 1, self.MAX_SERVICE_CODES)
         timeout = self._scaled_timeout(
             self.REQUEST_SERVICE_V2_PMMSLOT,
             len(service_list), enforce_min=True)
         pack_service = lambda x: x.pack()  # noqa: E731
         data = bytearray([len(service_list)]) \
             + b''.join(map(pack_service, service_list))
-        data = self._send_standard_command(self.REQUEST_SERVICE_V2_CMD, data, timeout)
+        data = self._send_standard_command(
+            self.REQUEST_SERVICE_V2_CMD, data, timeout)
 
         self._validate_status_flags(data)
         self._validate_min_length(data, 4)
@@ -1428,7 +1514,8 @@ class FelicaStandard(tt3.Type3Tag):
         """
         current_key = bytearray(FelicaStandard.V2_AES128_NODE_KEY_INIT)
         for key in node_keys:
-            current_key = FelicaStandard._encrypt_aes128_block(current_key, key)
+            current_key = FelicaStandard._encrypt_aes128_block(
+                current_key, key)
         return current_key
 
     def authenticated_context(self) -> Optional[AuthenticatedContext]:
@@ -1445,7 +1532,8 @@ class FelicaStandard(tt3.Type3Tag):
         instance.
 
         """
-        self._authenticated_context = self._normalize_authenticated_context(context)
+        self._authenticated_context = \
+            self._normalize_authenticated_context(context)
 
     def clear_authenticated_context(self) -> None:
         """Clear secure session context."""
@@ -1472,6 +1560,10 @@ class FelicaStandard(tt3.Type3Tag):
         """
         if len(challenge_1a) != 8:
             raise ValueError("challenge_1a must be 8 bytes")
+        if len(areas) > self.MAX_SERVICE_CODES:
+            raise ValueError("too many areas for authentication1")
+        if len(services) > self.MAX_SERVICE_CODES:
+            raise ValueError("too many services for authentication1")
         timeout = self._scaled_timeout(
             self.AUTHENTICATION1_PMMSLOT, len(areas) + len(services),
             enforce_min=True)
@@ -1481,7 +1573,8 @@ class FelicaStandard(tt3.Type3Tag):
             + bytearray([len(service_codes)]) \
             + b''.join([pack("<H", code) for code in service_codes]) \
             + bytearray(challenge_1a)
-        data = self._send_standard_command(self.AUTHENTICATION1_CMD, data, timeout)
+        data = self._send_standard_command(
+            self.AUTHENTICATION1_CMD, data, timeout)
         self._validate_exact_length(data, 16)
         return data[0:8], data[8:16]
 
@@ -1494,7 +1587,8 @@ class FelicaStandard(tt3.Type3Tag):
         """
         if len(challenge_2b) != 8:
             raise ValueError("challenge_2b must be 8 bytes")
-        timeout = self._base_timeout(self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
+        timeout = self._base_timeout(
+            self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
         data = self._send_command_with_idm_no_idm_response(
             self.AUTHENTICATION2_CMD, bytearray(challenge_2b), timeout)
         self._validate_min_length(data, 8)
@@ -1536,7 +1630,8 @@ class FelicaStandard(tt3.Type3Tag):
         challenge_1b, challenge_2a = self.authentication1(
             areas, services, challenge_1a)
 
-        if self._encrypt_3des_block(random_1, key_l, beta) != challenge_1b:
+        if not self._ct_eq(
+                self._encrypt_3des_block(random_1, key_l, beta), challenge_1b):
             self._raise_authentication_error(
                 "Authentication1 verification failed")
 
@@ -1595,6 +1690,8 @@ class FelicaStandard(tt3.Type3Tag):
     def _secure_read(
             self, command_code: int,
             block_list: Sequence[tt3.BlockCode]) -> List[bytearray]:
+        self._validate_list_length(
+            "block_list", len(block_list), 1, self.MAX_BLOCK_LIST_LEN)
         timeout = self._scaled_timeout(
             self.READ_PMMSLOT, len(block_list), enforce_min=True)
         payload = self._build_block_command_payload(block_list)
@@ -1612,13 +1709,17 @@ class FelicaStandard(tt3.Type3Tag):
     def _secure_write(
             self, command_code: int, block_list: Sequence[tt3.BlockCode],
             data: Octets) -> None:
+        self._validate_list_length(
+            "block_list", len(block_list), 1, self.MAX_BLOCK_LIST_LEN)
         if len(data) != len(block_list) * 16:
             raise ValueError("data length must be 16 * len(block_list)")
         timeout = self._scaled_timeout(
             self.WRITE_PMMSLOT, len(block_list), enforce_min=True)
         payload = self._build_block_command_payload(block_list, data)
         rsp = self._secure_command_exchange(command_code, payload, timeout)
-        self._validate_exact_length(rsp, 2)
+        # A DES secure response is CBC encrypted and therefore padded to a
+        # multiple of 8 byte, so only the leading status flags are fixed.
+        self._validate_min_length(rsp, 2)
         self._validate_status_flags(rsp, require_status_flag2_zero=True)
 
     def write(self, block_list: Sequence[tt3.BlockCode], data: Octets) -> None:
@@ -1661,7 +1762,8 @@ class FelicaStandard(tt3.Type3Tag):
 
             payload.extend(parameter1)
             payload.extend(parameter2)
-            block_list.append(tt3.BlockCode(new_key_version, access=4, service=0))
+            block_list.append(
+                tt3.BlockCode(new_key_version, access=4, service=0))
 
         self.write(block_list, payload)
 
@@ -1675,12 +1777,15 @@ class FelicaStandard(tt3.Type3Tag):
         """
         if len(challenge_1a) != 16:
             raise ValueError("challenge_1a must be 16 bytes")
+        if len(nodes) > self.MAX_SERVICE_CODES:
+            raise ValueError("too many nodes for authentication1 v2")
         timeout = self._scaled_timeout(
             self.AUTHENTICATION1_PMMSLOT, len(nodes), enforce_min=True)
         payload = bytearray([operation_parameter, len(nodes)]) \
             + b''.join([pack("<H", node) for node in nodes]) \
             + bytearray(challenge_1a)
-        data = self._send_standard_command(self.AUTHENTICATION1_V2_CMD, payload, timeout)
+        data = self._send_standard_command(
+            self.AUTHENTICATION1_V2_CMD, payload, timeout)
         self._validate_exact_length(data, 36)
         return data[0:16], data[16:32], data[32:36]
 
@@ -1692,7 +1797,8 @@ class FelicaStandard(tt3.Type3Tag):
         """
         if len(challenge_2b) != 16:
             raise ValueError("challenge_2b must be 16 bytes")
-        timeout = self._base_timeout(self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
+        timeout = self._base_timeout(
+            self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
         data = self._send_command_with_idm_no_idm_response(
             self.AUTHENTICATION2_V2_CMD, bytearray(challenge_2b), timeout)
         self._validate_min_length(data, 10)
@@ -1724,9 +1830,11 @@ class FelicaStandard(tt3.Type3Tag):
         random_1 = bytearray(os.urandom(16))
         h = self._xor_bytes(group_key, individual_key)
         alpha = self._encrypt_aes128_block(
-            self._build_authentication_context_block_v2([0x01, 0x02], self.idm[0:8]), h)
+            self._build_authentication_context_block_v2(
+                [0x01, 0x02], self.idm[0:8]), h)
         beta = self._encrypt_aes128_block(
-            self._build_authentication_context_block_v2([0x02, 0x02], self.idm[0:8]), h)
+            self._build_authentication_context_block_v2(
+                [0x02, 0x02], self.idm[0:8]), h)
 
         challenge_1a = self._encrypt_aes128_block(random_1, alpha)
         challenge_1b, challenge_2a, challenge_3c = self.authentication1_v2(
@@ -1735,8 +1843,11 @@ class FelicaStandard(tt3.Type3Tag):
         beta_mask = bytearray(16)
         beta_mask[0:4] = challenge_3c
         beta_with_3c = self._xor_bytes(beta, beta_mask)
-        if self._encrypt_aes128_block(random_1, beta_with_3c) != challenge_1b:
-            self._raise_authentication_error("Authentication1 v2 verification failed")
+        if not self._ct_eq(
+                self._encrypt_aes128_block(random_1, beta_with_3c),
+                challenge_1b):
+            self._raise_authentication_error(
+                "Authentication1 v2 verification failed")
 
         random_2 = self._decrypt_aes128_block(challenge_2a, beta_with_3c)
         challenge_2b = self._encrypt_aes128_block(random_2, alpha)
@@ -1750,7 +1861,8 @@ class FelicaStandard(tt3.Type3Tag):
             self.AUTHENTICATION2_V2_CMD + 1, transaction_id, challenge_3c,
             encryption_key, mac_key, encrypted_payload)
         if len(payload) < 16:
-            self._raise_protocol_error("Authentication2 v2 response payload too short")
+            self._raise_protocol_error(
+                "Authentication2 v2 response payload too short")
 
         issue_id = payload[0:8]
         issue_parameter = payload[8:16]
@@ -1768,16 +1880,19 @@ class FelicaStandard(tt3.Type3Tag):
     def _generate_registration_package_des(
             self, package_plain: Octets, package_key: Octets) -> bytearray:
         if len(package_plain) == 0 or len(package_plain) % 8 != 0:
-            raise ValueError("registration package must be multiple of 8 bytes")
+            raise ValueError(
+                "registration package must be multiple of 8 bytes")
         if len(package_key) != 8:
             raise ValueError("package_key must be 8 bytes")
 
         mac_key = bytearray([x ^ 0xFF for x in bytearray(package_key)])
         encrypted_plain = self._encrypt_des_cbc_zero_iv(package_plain, mac_key)
         if len(encrypted_plain) < 8:
-            self._raise_protocol_error("registration package MAC calculation failed")
+            self._raise_protocol_error(
+                "registration package MAC calculation failed")
         mac = encrypted_plain[-8:]
-        return self._encrypt_des_cbc_zero_iv(bytearray(package_plain) + mac, package_key)
+        return self._encrypt_des_cbc_zero_iv(
+            bytearray(package_plain) + mac, package_key)
 
     def register_issue_id(
             self, system_code: int, area0_key_version: int, area0_key: Octets,
@@ -1788,16 +1903,21 @@ class FelicaStandard(tt3.Type3Tag):
         Returns remaining block count.
 
         """
-        if len(area0_key) != 8 or len(issue_id) != 8 or len(issue_parameter) != 8:
-            raise ValueError("area0_key, issue_id and issue_parameter must be 8 bytes")
+        if (len(area0_key) != 8 or len(issue_id) != 8
+                or len(issue_parameter) != 8):
+            raise ValueError(
+                "area0_key, issue_id and issue_parameter must be 8 bytes")
         package_plain = bytearray(pack(">H", system_code)) \
             + bytearray(pack("<H", area0_key_version)) \
             + bytearray(area0_key) + bytearray(4)
-        package = self._generate_registration_package_des(package_plain, package_key)
+        package = self._generate_registration_package_des(
+            package_plain, package_key)
 
-        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        timeout = self._base_timeout(
+            self.REGISTRATION_PMMSLOT, enforce_min=True)
         payload = bytearray(issue_id) + bytearray(issue_parameter) + package
-        data = self._secure_command_exchange(self.REGISTER_ISSUE_ID_CMD, payload, timeout)
+        data = self._secure_command_exchange(
+            self.REGISTER_ISSUE_ID_CMD, payload, timeout)
         self._validate_status_flags(data)
         return unpack("<H", data[2:4])[0]
 
@@ -1812,13 +1932,17 @@ class FelicaStandard(tt3.Type3Tag):
         if len(area_key) != 8:
             raise ValueError("area_key must be 8 bytes")
 
-        package_plain = bytearray(pack("<HHHH", service_begin, service_end, size, key_version))
+        package_plain = bytearray(pack(
+            "<HHHH", service_begin, service_end, size, key_version))
         package_plain.extend(bytearray(area_key))
-        package = self._generate_registration_package_des(package_plain, package_key)
+        package = self._generate_registration_package_des(
+            package_plain, package_key)
 
-        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        timeout = self._base_timeout(
+            self.REGISTRATION_PMMSLOT, enforce_min=True)
         payload = bytearray(pack("<H", area_code)) + package
-        data = self._secure_command_exchange(self.REGISTER_AREA_CMD, payload, timeout)
+        data = self._secure_command_exchange(
+            self.REGISTER_AREA_CMD, payload, timeout)
         self._validate_status_flags(data, require_status_flag2_zero=True)
 
     def register_service(
@@ -1837,18 +1961,23 @@ class FelicaStandard(tt3.Type3Tag):
         package_plain.extend(bytearray(pack("<H", size)))
         package_plain.extend(bytearray(pack("<H", key_version)))
         package_plain.extend(bytearray(service_key))
-        package = self._generate_registration_package_des(package_plain, package_key)
+        package = self._generate_registration_package_des(
+            package_plain, package_key)
 
-        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        timeout = self._base_timeout(
+            self.REGISTRATION_PMMSLOT, enforce_min=True)
         payload = bytearray(pack("<H", service_code)) + package
-        data = self._secure_command_exchange(self.REGISTER_SERVICE_CMD, payload, timeout)
+        data = self._secure_command_exchange(
+            self.REGISTER_SERVICE_CMD, payload, timeout)
         self._validate_status_flags(data)
         return unpack("<H", data[2:4])[0]
 
     def change_system_block(self) -> None:
         """Run Change System Block secure command."""
-        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
-        data = self._secure_command_exchange(self.CHANGE_SYSTEM_BLOCK_CMD, b'', timeout)
+        timeout = self._base_timeout(
+            self.REGISTRATION_PMMSLOT, enforce_min=True)
+        data = self._secure_command_exchange(
+            self.CHANGE_SYSTEM_BLOCK_CMD, b'', timeout)
         self._validate_status_flags(data, require_status_flag2_zero=True)
 
 

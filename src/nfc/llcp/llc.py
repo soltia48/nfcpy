@@ -395,11 +395,11 @@ class LogicalLinkController(object):
 
     def terminate(self, reason):
         log.debug("llcp link termination caused by {0}".format(reason))
-        if type(self.mac) == nfc.dep.Initiator:
+        if type(self.mac) is nfc.dep.Initiator:
             if self.link.DISCONNECT is True:
                 self.exchange(pdu.Disconnect(0, 0), timeout=0.5)
             self.mac.deactivate(release=False)  # use DESELECT
-        if type(self.mac) == nfc.dep.Target:
+        if type(self.mac) is nfc.dep.Target:
             self.mac.deactivate(data=bytearray(b"\x01\x40"))
         # shutdown local services
         for i in range(63, -1, -1):

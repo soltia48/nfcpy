@@ -329,7 +329,7 @@ class Chipset(object):
             return self.REGBYNAME[r] if type(r) is str else r
 
         assert type(args) in (tuple, list)
-        if len(args) == 2 and type(args[1]) == int:
+        if len(args) == 2 and type(args[1]) is int:
             args = [args]
         args = [(addr(reg), val) for reg, val in args]
         data = b''.join([pack(">HB", reg, val) for reg, val in args])
