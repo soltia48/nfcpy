@@ -25,10 +25,26 @@ from . import tt2
 import os
 import struct
 from binascii import hexlify
-from pyDes import triple_des, CBC
+from Crypto.Cipher import DES, DES3
 
 import logging
 log = logging.getLogger(__name__)
+
+
+def triple_des_cbc(key, iv):
+    """Return a 3DES cipher in CBC mode for the 16 byte *key* and *iv*.
+
+    A 16 byte key is used in EDE2 mode, i.e. as K1-K2-K1. If both key
+    halves are the same (disregarding the DES parity bits) this becomes
+    equivalent to single DES. A card may well be configured with such a
+    key but PyCryptodome refuses to construct a 3DES cipher for it, thus
+    a single DES cipher is returned for that case.
+
+    """
+    key_1, key_2 = bytearray(key[0:8]), bytearray(key[8:16])
+    if all(k1 & 0xFE == k2 & 0xFE for k1, k2 in zip(key_1, key_2)):
+        return DES.new(bytes(key[0:8]), DES.MODE_CBC, iv)
+    return DES3.new(bytes(key), DES3.MODE_CBC, iv)
 
 
 class MifareUltralight(tt2.Type2Tag):
@@ -213,7 +229,7 @@ class MifareUltralightC(tt2.Type2Tag):
         rsp = self.transceive(b"\x1A\x00")
         m1 = bytes(rsp[1:9])
         iv = b"\x00\x00\x00\x00\x00\x00\x00\x00"
-        rb = triple_des(key, CBC, iv).decrypt(m1)
+        rb = triple_des_cbc(key, iv).decrypt(m1)
 
         log.debug("received challenge")
         log.debug("iv = %s", hexlify(iv).decode())
@@ -223,7 +239,7 @@ class MifareUltralightC(tt2.Type2Tag):
         ra = os.urandom(8)
         iv = bytes(rsp[1:9])
 
-        m2 = triple_des(key, CBC, iv).encrypt(ra + rb[1:8] + (
+        m2 = triple_des_cbc(key, iv).encrypt(ra + rb[1:8] + (
             struct.pack("B", rb[0]) if isinstance(rb[0], int) else rb[0]))
 
         log.debug("sending response")
@@ -241,7 +257,7 @@ class MifareUltralightC(tt2.Type2Tag):
         log.debug("iv = %s", hexlify(iv).decode())
         log.debug("m3 = %s", hexlify(m3).decode())
 
-        return triple_des(key, CBC, iv).decrypt(m3) == ra[1:9] \
+        return triple_des_cbc(key, iv).decrypt(m3) == ra[1:9] \
             + (struct.pack("B", ra[0]) if isinstance(ra[0], int) else ra[0])
 
 

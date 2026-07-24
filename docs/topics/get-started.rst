@@ -53,7 +53,7 @@ Then, install libusb:
 
 **Install Python and nfcpy**
 
-Download and install `Python`_ (2.7 or 3.5 or later).
+Download and install `Python`_ (3.8 or later).
 
 .. note::
 

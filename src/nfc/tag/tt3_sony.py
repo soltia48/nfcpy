@@ -22,18 +22,176 @@
 import nfc.tag
 from . import tt3
 
+from dataclasses import dataclass
 import os
 import struct
 from binascii import hexlify
-from pyDes import triple_des, CBC
+from Crypto.Cipher import AES, DES, DES3
+from Crypto.Hash import CMAC
 from struct import pack, unpack
+from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, TypedDict, Union
 import itertools
 
 import logging
 log = logging.getLogger(__name__)
 
+Octets = Union[bytes, bytearray, memoryview]
+SecureSessionScheme = str
+AreaCodeRange = Tuple[int, int]
+ServiceVersion = Union[int, Tuple[int, int]]
 
-def activate(clf, target):
+
+class OptionVersion(TypedDict):
+    major: int
+    minor: int
+    patch: int
+
+
+@dataclass
+class SpecificationVersion:
+    format_version: int
+    basic_version: OptionVersion
+    option_versions: List[OptionVersion]
+
+    def _option_version(self, index: int) -> Optional[OptionVersion]:
+        if 0 <= index < len(self.option_versions):
+            return self.option_versions[index]
+        return None
+
+    @property
+    def des_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(0)
+
+    @property
+    def special_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(1)
+
+    @property
+    def extended_overlap_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(2)
+
+    @property
+    def value_limited_purse_service_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(3)
+
+    @property
+    def communication_with_mac_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(4)
+
+    @property
+    def random_id_option_version(self) -> Optional[OptionVersion]:
+        return self._option_version(5)
+
+
+# Backward-compatible aliases for the previous TypedDict names.
+SpecificationVersionInfo = SpecificationVersion
+SpecVersionInfo = SpecificationVersion
+
+
+class NodePropertyValueLimitedPurseService(TypedDict):
+    enabled: bool
+    upper_limit: int
+    lower_limit: int
+    generation_number: int
+
+
+class NodePropertyMacCommunication(TypedDict):
+    enabled: bool
+
+
+NodeProperty = Union[
+    NodePropertyValueLimitedPurseService,
+    NodePropertyMacCommunication,
+]
+
+
+@dataclass
+class DesSecureSessionCredentials:
+    session_key: Octets
+
+    def __post_init__(self) -> None:
+        self.session_key = bytearray(self.session_key)
+        if len(self.session_key) != 8:
+            raise ValueError("session_key must be 8 bytes")
+
+    def clone(self) -> "DesSecureSessionCredentials":
+        return DesSecureSessionCredentials(bytearray(self.session_key))
+
+
+@dataclass
+class Aes128SecureSessionCredentials:
+    encryption_key: Octets
+    mac_key: Octets
+    challenge_3c: Octets
+
+    def __post_init__(self) -> None:
+        self.encryption_key = bytearray(self.encryption_key)
+        self.mac_key = bytearray(self.mac_key)
+        self.challenge_3c = bytearray(self.challenge_3c)
+        if len(self.encryption_key) != 16 or len(self.mac_key) != 16:
+            raise ValueError("encryption_key and mac_key must be 16 bytes")
+        if len(self.challenge_3c) != 4:
+            raise ValueError("challenge_3c must be 4 bytes")
+
+    def clone(self) -> "Aes128SecureSessionCredentials":
+        return Aes128SecureSessionCredentials(
+            bytearray(self.encryption_key),
+            bytearray(self.mac_key),
+            bytearray(self.challenge_3c),
+        )
+
+
+SecureSessionCredentials = Union[DesSecureSessionCredentials, Aes128SecureSessionCredentials]
+
+
+@dataclass
+class AuthenticatedContext:
+    transaction_number: int
+    transaction_id: Octets
+    credentials: SecureSessionCredentials
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transaction_number, int):
+            raise ValueError("transaction_number must be an integer")
+        if not 0 <= self.transaction_number <= 0xFFFF:
+            raise ValueError("transaction_number must be in range 0..65535")
+        self.transaction_id = bytearray(self.transaction_id)
+        if len(self.transaction_id) != 6:
+            raise ValueError("transaction_id must be 6 bytes")
+        if isinstance(self.credentials, (DesSecureSessionCredentials, Aes128SecureSessionCredentials)):
+            return
+        raise ValueError("credentials must be DES or AES128 secure session credentials")
+
+    @property
+    def scheme(self) -> SecureSessionScheme:
+        if isinstance(self.credentials, DesSecureSessionCredentials):
+            return "des"
+        return "aes128"
+
+    def clone(self) -> "AuthenticatedContext":
+        if isinstance(self.credentials, DesSecureSessionCredentials):
+            credentials = self.credentials.clone()
+        else:
+            credentials = self.credentials.clone()
+        return AuthenticatedContext(
+            transaction_number=self.transaction_number,
+            transaction_id=bytearray(self.transaction_id),
+            credentials=credentials,
+        )
+
+    def increment_transaction_number(self) -> None:
+        if self.transaction_number >= 0xFFFF:
+            raise ValueError("secure session transaction number overflow")
+        self.transaction_number += 1
+
+
+class ChangeKeyParam(TypedDict):
+    parent_key: Octets
+    new_key: Octets
+    old_key: Octets
+    new_key_version: int
+
+def activate(clf, target) -> Optional[tt3.Type3Tag]:
     # http://www.sony.net/Products/felica/business/tech-support/list.html
     ic_code = target.sensf_res[10]
     if ic_code in FelicaLite.IC_CODE_MAP.keys():
@@ -71,11 +229,517 @@ class FelicaStandard(tt3.Type3Tag):
         0x32: ("RC-SA00/1",  1,  1),  # AES chip
         0x35: ("RC-SA00/2",  1,  1),
     }
+    # Command codes for FeliCa Standard commands.
+    REQUEST_SERVICE_CMD = 0x02
+    REQUEST_RESPONSE_CMD = 0x04
+    SEARCH_SERVICE_CODE_CMD = 0x0A
+    REQUEST_SYSTEM_CODE_CMD = 0x0C
+    REQUEST_BLOCK_INFORMATION_CMD = 0x0E
+    AUTHENTICATION1_CMD = 0x10
+    AUTHENTICATION2_CMD = 0x12
+    READ_CMD = 0x14
+    WRITE_CMD = 0x16
+    REQUEST_CODE_LIST_CMD = 0x1A
+    REQUEST_BLOCK_INFORMATION_EX_CMD = 0x1E
+    SET_PARAMETER_CMD = 0x20
+    GET_CONTAINER_ISSUE_INFORMATION_CMD = 0x22
+    GET_AREA_INFORMATION_CMD = 0x24
+    GET_NODE_PROPERTY_CMD = 0x28
+    GET_CONTAINER_PROPERTY_CMD = 0x2E
+    REQUEST_SERVICE_V2_CMD = 0x32
+    GET_SYSTEM_STATUS_CMD = 0x38
+    REQUEST_PRODUCT_INFORMATION_CMD = 0x3A
+    REQUEST_SPECIFICATION_VERSION_CMD = 0x3C
+    RESET_MODE_CMD = 0x3E
+    AUTHENTICATION1_V2_CMD = 0x40
+    AUTHENTICATION2_V2_CMD = 0x42
+    READ_V2_CMD = 0x44
+    WRITE_V2_CMD = 0x46
+    GET_CONTAINER_ID_CMD = 0x70
+    REGISTER_ISSUE_ID_CMD = 0x80
+    REGISTER_AREA_CMD = 0x82
+    REGISTER_SERVICE_CMD = 0x84
+    CHANGE_SYSTEM_BLOCK_CMD = 0x8E
+
+    # PMm timing slots used by the currently implemented commands.
+    REQUEST_SERVICE_PMMSLOT = 2
+    REQUEST_RESPONSE_PMMSLOT = 3
+    SEARCH_SERVICE_CODE_PMMSLOT = 3
+    REQUEST_SYSTEM_CODE_PMMSLOT = 3
+    REQUEST_BLOCK_INFORMATION_PMMSLOT = 2
+    AUTHENTICATION1_PMMSLOT = 4
+    AUTHENTICATION2_PMMSLOT = 4
+    READ_PMMSLOT = 5
+    WRITE_PMMSLOT = 6
+    REQUEST_CODE_LIST_PMMSLOT = 2
+    REQUEST_BLOCK_INFORMATION_EX_PMMSLOT = 2
+    SET_PARAMETER_PMMSLOT = 7
+    GET_CONTAINER_ISSUE_INFORMATION_PMMSLOT = 7
+    GET_AREA_INFORMATION_PMMSLOT = 3
+    GET_NODE_PROPERTY_PMMSLOT = 2
+    GET_CONTAINER_PROPERTY_PMMSLOT = 7
+    REQUEST_SERVICE_V2_PMMSLOT = 2
+    GET_SYSTEM_STATUS_PMMSLOT = 3
+    REQUEST_PRODUCT_INFORMATION_PMMSLOT = 7
+    REQUEST_SPECIFICATION_VERSION_PMMSLOT = 3
+    RESET_MODE_PMMSLOT = 3
+    REGISTRATION_PMMSLOT = 7
+    GET_CONTAINER_ID_PMMSLOT = 7
+
+    NODE_PROPERTY_VALUE_LIMITED_PURSE_SERVICE = 0x00
+    NODE_PROPERTY_MAC_COMMUNICATION = 0x01
+
+    REQUEST_SERVICE_V2_DUAL_KEYS_AES128 = 0x41
+    REQUEST_SERVICE_V2_DUAL_KEYS_AES_CMAC = 0x43
+    SECURE_SCHEME_DES = "des"
+    SECURE_SCHEME_AES128 = "aes128"
+    V2_AES128_NODE_KEY_INIT = bytearray([
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80])
+    V2_AES128_AUTH_CONTEXT_SUFFIX = b"\x01\x00"
+    V2_AES128_DERIVE_ENCRYPTION_KEY_INPUT = bytearray([
+        0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00])
+    V2_AES128_DERIVE_MAC_KEY_INPUT = bytearray([
+        0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00])
+
+    TIMEOUT_UNIT = 302E-6
+    MIN_TIMEOUT = 0.002
 
     def __init__(self, clf, target):
         super(FelicaStandard, self).__init__(clf, target)
         self._product = "FeliCa Standard ({0})".format(
             self.IC_CODE_MAP[self.pmm[1]][0])
+        self._authenticated_context = None  # type: Optional[AuthenticatedContext]
+
+    def _timing_params(self, pmm_slot: int) -> Tuple[int, int, int]:
+        pmm_byte = self.pmm[pmm_slot]
+        return pmm_byte & 7, pmm_byte >> 3 & 7, pmm_byte >> 6
+
+    def _base_timeout(self, pmm_slot: int, enforce_min: bool = False) -> float:
+        a, _, e = self._timing_params(pmm_slot)
+        timeout = self.TIMEOUT_UNIT * (a + 1) * 4**e
+        return max(timeout, self.MIN_TIMEOUT) if enforce_min else timeout
+
+    def _scaled_timeout(
+            self, pmm_slot: int, units: int, enforce_min: bool = False) -> float:
+        a, b, e = self._timing_params(pmm_slot)
+        timeout = self.TIMEOUT_UNIT * ((b + 1) * units + a + 1) * 4**e
+        return max(timeout, self.MIN_TIMEOUT) if enforce_min else timeout
+
+    def _send_standard_command(
+            self, cmd_code: int, cmd_data: Octets, timeout: float) -> bytearray:
+        return self.send_cmd_recv_rsp(
+            cmd_code, cmd_data, timeout, check_status=False)
+
+    @staticmethod
+    def _raise_data_size_error() -> NoReturn:
+        log.debug("insufficient data received from tag")
+        raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
+
+    @classmethod
+    def _validate_exact_length(cls, data: Octets, size: int) -> None:
+        if len(data) != size:
+            cls._raise_data_size_error()
+
+    @classmethod
+    def _validate_min_length(cls, data: Octets, size: int) -> None:
+        if len(data) < size:
+            cls._raise_data_size_error()
+
+    @staticmethod
+    def _raise_status_flag_error(status_flag1: int, status_flag2: int) -> NoReturn:
+        log.debug("tag returned error status {0:02x}{1:02x}".format(
+            status_flag1, status_flag2))
+        raise tt3.Type3TagCommandError(status_flag1 << 8 | status_flag2)
+
+    @classmethod
+    def _parse_status_flags(
+            cls, data: Octets, min_length: int = 2) -> Tuple[int, int]:
+        cls._validate_min_length(data, min_length)
+        return data[0], data[1]
+
+    @classmethod
+    def _validate_status_flags(
+            cls, data: Octets, min_length: int = 2,
+            require_status_flag2_zero: bool = False) -> Tuple[int, int]:
+        status_flag1, status_flag2 = cls._parse_status_flags(
+            data, min_length=min_length)
+        if status_flag1 != 0 or (require_status_flag2_zero and status_flag2 != 0):
+            cls._raise_status_flag_error(status_flag1, status_flag2)
+        return status_flag1, status_flag2
+
+    @staticmethod
+    def _parse_option_version(option_bytes: Octets) -> OptionVersion:
+        return {
+            "major": option_bytes[1] & 0x0F,
+            "minor": (option_bytes[0] >> 4) & 0x0F,
+            "patch": option_bytes[0] & 0x0F,
+        }
+
+    @staticmethod
+    def _raise_protocol_error(message: str) -> NoReturn:
+        log.debug(message)
+        raise tt3.Type3TagCommandError(nfc.tag.PROTOCOL_ERROR)
+
+    @staticmethod
+    def _raise_authentication_error(message: str) -> NoReturn:
+        log.debug(message)
+        raise RuntimeError(message)
+
+    def _send_without_response_idm(
+            self, cmd_code: int, cmd_data: Octets, timeout: float) -> bytearray:
+        return self.send_cmd_recv_rsp(
+            cmd_code, cmd_data, timeout, send_idm=False, check_status=False)
+
+    def _send_command_with_idm_no_idm_response(
+            self, cmd_code: int, payload: Octets, timeout: float) -> bytearray:
+        return self._send_without_response_idm(cmd_code, self.idm + payload, timeout)
+
+    @staticmethod
+    def _to_bytes(data: Octets) -> bytes:
+        return bytes(bytearray(data))
+
+    @staticmethod
+    def _xor_bytes(a: Octets, b: Octets) -> bytearray:
+        return bytearray([x ^ y for x, y in zip(bytearray(a), bytearray(b))])
+
+    @staticmethod
+    def _ceil_to_multiple(value: int, unit: int) -> int:
+        return ((value + unit - 1) // unit) * unit
+
+    @staticmethod
+    def _pad_pkcs7(data: Octets, block_size: int) -> bytearray:
+        data = bytearray(data)
+        remainder = len(data) % block_size
+        if remainder != 0:
+            pad = block_size - remainder
+            data.extend([pad] * pad)
+        return data
+
+    @classmethod
+    def _encrypt_des_block(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) != 8 or len(key) != 8:
+            cls._raise_protocol_error(
+                "DES block encrypt requires 8-byte block and key")
+        cipher = DES.new(cls._to_bytes(key), DES.MODE_ECB)
+        return bytearray(cipher.encrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _decrypt_des_block(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) != 8 or len(key) != 8:
+            cls._raise_protocol_error(
+                "DES block decrypt requires 8-byte block and key")
+        cipher = DES.new(cls._to_bytes(key), DES.MODE_ECB)
+        return bytearray(cipher.decrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _normalize_3des_key(cls, key: Octets) -> bytes:
+        key = bytearray(key)
+        if len(key) in (16, 24):
+            return cls._to_bytes(key)
+        cls._raise_protocol_error("3DES key must be 16 or 24 bytes")
+
+    @classmethod
+    def _encrypt_3des_block_keys(
+            cls, data: Octets, key1: Octets, key2: Octets,
+            key3: Octets) -> bytearray:
+        if (len(data) != 8 or len(key1) != 8 or
+                len(key2) != 8 or len(key3) != 8):
+            cls._raise_protocol_error(
+                "3DES block encrypt requires 8-byte block and keys")
+        key = cls._to_bytes(key1) + cls._to_bytes(key2) + cls._to_bytes(key3)
+        cipher = DES3.new(key, DES3.MODE_ECB)
+        return bytearray(cipher.encrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _decrypt_3des_block_keys(
+            cls, data: Octets, key1: Octets, key2: Octets,
+            key3: Octets) -> bytearray:
+        if (len(data) != 8 or len(key1) != 8 or
+                len(key2) != 8 or len(key3) != 8):
+            cls._raise_protocol_error(
+                "3DES block decrypt requires 8-byte block and keys")
+        key = cls._to_bytes(key1) + cls._to_bytes(key2) + cls._to_bytes(key3)
+        cipher = DES3.new(key, DES3.MODE_ECB)
+        return bytearray(cipher.decrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _encrypt_3des_block(
+            cls, data: Octets, key1: Octets, key2: Octets) -> bytearray:
+        if len(data) != 8 or len(key1) != 8 or len(key2) != 8:
+            cls._raise_protocol_error(
+                "3DES block encrypt requires 8-byte block and keys")
+        return cls._encrypt_3des_block_keys(data, key1, key2, key1)
+
+    @classmethod
+    def _decrypt_3des_block(
+            cls, data: Octets, key1: Octets, key2: Octets) -> bytearray:
+        if len(data) != 8 or len(key1) != 8 or len(key2) != 8:
+            cls._raise_protocol_error(
+                "3DES block decrypt requires 8-byte block and keys")
+        return cls._decrypt_3des_block_keys(data, key1, key2, key1)
+
+    @classmethod
+    def _encrypt_des_cbc_zero_iv(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) % 8 != 0 or len(key) != 8:
+            cls._raise_protocol_error(
+                "DES-CBC payload must be multiple of 8 bytes")
+        cipher = DES.new(cls._to_bytes(key), DES.MODE_CBC, iv=b"\x00" * 8)
+        return bytearray(cipher.encrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _decrypt_des_cbc_zero_iv(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) % 8 != 0 or len(key) != 8:
+            cls._raise_protocol_error(
+                "DES-CBC payload must be multiple of 8 bytes")
+        cipher = DES.new(cls._to_bytes(key), DES.MODE_CBC, iv=b"\x00" * 8)
+        return bytearray(cipher.decrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _encrypt_3des_cbc(
+            cls, data: Octets, key: Octets, iv: Octets) -> bytearray:
+        if len(data) % 8 != 0 or len(iv) != 8:
+            cls._raise_protocol_error(
+                "3DES-CBC payload must be multiple of 8 bytes")
+        cipher = DES3.new(
+            cls._normalize_3des_key(key),
+            DES3.MODE_CBC, iv=cls._to_bytes(iv))
+        return bytearray(cipher.encrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _calculate_command_mac_des(
+            cls, command_code: int, payload: Octets) -> bytearray:
+        if len(payload) % 8 != 0:
+            cls._raise_protocol_error("secure command payload must be multiple of 8 bytes")
+        total_length = 2 + len(payload) + 8
+        if total_length > 255:
+            cls._raise_protocol_error("secure command payload exceeds maximum frame length")
+        mac = bytearray(8)
+        mac[0] = total_length
+        mac[1] = command_code
+        for i in range(0, len(payload), 8):
+            mac = cls._encrypt_des_block(mac, payload[i:i+8])
+        return mac
+
+    @classmethod
+    def _check_packet_mac_des(
+            cls, data: Octets, expected_response_code: int) -> bool:
+        if len(data) < 16 or len(data) % 8 != 0:
+            return False
+        payload, mac = data[:-8], data[-8:]
+        x = bytearray(mac)
+        for i in range(len(payload)-8, -1, -8):
+            x = cls._decrypt_des_block(x, payload[i:i+8])
+        return x[0] == ((len(data) + 2) & 0xFF) and x[1] == expected_response_code
+
+    @classmethod
+    def _encrypt_secure_command_des(
+            cls, command_code: int, payload: Octets,
+            session_key: Octets) -> bytearray:
+        padded = cls._pad_pkcs7(payload, 8)
+        mac = cls._calculate_command_mac_des(command_code, padded)
+        return cls._encrypt_des_cbc_zero_iv(padded + mac, session_key)
+
+    @classmethod
+    def _decrypt_secure_response_des(
+            cls, response_code: int, expected_transaction_id: Octets,
+            session_key: Octets, encrypted_payload: Octets) -> Tuple[int, bytearray]:
+        plain = cls._decrypt_des_cbc_zero_iv(encrypted_payload, session_key)
+        if cls._check_packet_mac_des(plain, response_code) is False:
+            cls._raise_protocol_error("secure response MAC verification failed")
+        if len(plain) < 24:
+            cls._raise_protocol_error("secure response payload too short")
+        transaction_number = unpack("<H", plain[0:2])[0]
+        transaction_id = plain[2:8]
+        if transaction_id != expected_transaction_id:
+            cls._raise_protocol_error("secure response transaction ID mismatch")
+        payload_with_pad = plain[8:-8]
+        return transaction_number, payload_with_pad
+
+    @staticmethod
+    def _clone_authenticated_context(
+            context: AuthenticatedContext) -> AuthenticatedContext:
+        return context.clone()
+
+    @staticmethod
+    def _normalize_authenticated_context(
+            context: AuthenticatedContext) -> AuthenticatedContext:
+        if not isinstance(context, AuthenticatedContext):
+            raise TypeError("context must be AuthenticatedContext")
+        return context.clone()
+
+    def _ensure_authenticated_context(self) -> AuthenticatedContext:
+        if self._authenticated_context is None:
+            self._raise_authentication_error("authentication required")
+        return self._authenticated_context
+
+    def _capture_secure_command_context(self) -> AuthenticatedContext:
+        context = self._ensure_authenticated_context()
+        try:
+            context.increment_transaction_number()
+        except ValueError as error:
+            self._raise_protocol_error(str(error))
+        return self._clone_authenticated_context(context)
+
+    @classmethod
+    def _encrypt_aes128_block(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) != 16 or len(key) != 16:
+            cls._raise_protocol_error("AES block encrypt requires 16-byte block and key")
+        cipher = AES.new(cls._to_bytes(key), AES.MODE_ECB)
+        return bytearray(cipher.encrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _decrypt_aes128_block(cls, data: Octets, key: Octets) -> bytearray:
+        if len(data) != 16 or len(key) != 16:
+            cls._raise_protocol_error("AES block decrypt requires 16-byte block and key")
+        cipher = AES.new(cls._to_bytes(key), AES.MODE_ECB)
+        return bytearray(cipher.decrypt(cls._to_bytes(data)))
+
+    @classmethod
+    def _calculate_mac_v2_aes128(
+            cls, iv: Octets, payload: Octets, mac_key: Octets) -> bytearray:
+        if len(iv) != 16 or len(mac_key) != 16:
+            cls._raise_protocol_error("AES v2 MAC requires 16-byte IV and key")
+        b0 = bytearray(16)
+        b0[0] = 0x19
+        b0[1:14] = iv[1:14]
+        b0[14:16] = pack(">H", len(payload))
+        cmac = CMAC.new(cls._to_bytes(mac_key), ciphermod=AES)
+        cmac.update(cls._to_bytes(b0))
+        cmac.update(cls._to_bytes(payload))
+        return bytearray(cmac.digest()[:8])
+
+    @classmethod
+    def _crypt_payload_and_mac_v2_aes128(
+            cls, encryption_key: Octets, iv: Octets, payload: Octets,
+            mac: Octets) -> Tuple[bytearray, bytearray]:
+        if len(encryption_key) != 16 or len(iv) != 16 or len(mac) != 8:
+            cls._raise_protocol_error("AES v2 secure payload has invalid key or IV length")
+        stream = AES.new(
+            cls._to_bytes(encryption_key), AES.MODE_OFB, iv=cls._to_bytes(iv))
+        payload_out = bytearray(stream.encrypt(cls._to_bytes(payload)))
+        aligned = cls._ceil_to_multiple(len(payload), 16)
+        if aligned > len(payload):
+            stream.encrypt(b"\x00" * (aligned - len(payload)))
+        mac_out = bytearray(stream.encrypt(cls._to_bytes(mac)))
+        return payload_out, mac_out
+
+    @classmethod
+    def _build_initial_vector_v2_aes128(
+            cls, frame_length: int, code: int, counter_bytes: Octets,
+            transaction_id: Octets, challenge_3c: Octets) -> bytearray:
+        iv = bytearray(16)
+        iv[0] = 0x01
+        iv[1] = frame_length & 0xFF
+        iv[2] = code
+        iv[3:5] = counter_bytes
+        iv[5:11] = transaction_id
+        iv[11:14] = challenge_3c[1:4]
+        return iv
+
+    @classmethod
+    def _encrypt_secure_request_v2_aes128(
+            cls, command_code: int, transaction_number: int,
+            transaction_id: Octets, challenge_3c: Octets,
+            encryption_key: Octets, mac_key: Octets,
+            payload: Octets) -> bytearray:
+        counter_bytes = pack("<H", transaction_number)
+        frame_length = 1 + 1 + 2 + len(payload) + 8
+        if frame_length > 255:
+            cls._raise_protocol_error("secure command payload exceeds maximum frame length")
+        iv = cls._build_initial_vector_v2_aes128(
+            frame_length, command_code, counter_bytes, transaction_id, challenge_3c)
+        mac = cls._calculate_mac_v2_aes128(iv, payload, mac_key)
+        cipher_payload, cipher_mac = cls._crypt_payload_and_mac_v2_aes128(
+            encryption_key, iv, payload, mac)
+        return bytearray(counter_bytes) + cipher_payload + cipher_mac
+
+    @classmethod
+    def _decrypt_secure_response_v2_aes128(
+            cls, response_code: int, transaction_id: Octets,
+            challenge_3c: Octets, encryption_key: Octets,
+            mac_key: Octets, data: Octets) -> Tuple[int, bytearray]:
+        if len(data) < 10:
+            cls._raise_protocol_error("secure response too short for AES v2 framing")
+        counter_bytes = data[0:2]
+        transaction_number = unpack("<H", counter_bytes)[0]
+        cipher_payload = data[2:-8]
+        cipher_mac = data[-8:]
+
+        frame_length = 2 + len(data)
+        if frame_length > 255:
+            cls._raise_protocol_error("secure response exceeds maximum frame length")
+        iv = cls._build_initial_vector_v2_aes128(
+            frame_length, response_code, counter_bytes, transaction_id, challenge_3c)
+        payload, mac_plain = cls._crypt_payload_and_mac_v2_aes128(
+            encryption_key, iv, cipher_payload, cipher_mac)
+        expected_mac = cls._calculate_mac_v2_aes128(iv, payload, mac_key)
+        if mac_plain != expected_mac:
+            cls._raise_protocol_error("secure response MAC verification failed for AES v2")
+        return transaction_number, payload
+
+    def _secure_command_exchange(
+            self, command_code: int, command_payload: Octets,
+            timeout: float) -> bytearray:
+        command_context = self._capture_secure_command_context()
+        transaction_number = command_context.transaction_number
+        transaction_id = command_context.transaction_id
+        credentials = command_context.credentials
+
+        if isinstance(credentials, DesSecureSessionCredentials):
+            secure_payload = bytearray(pack("<H", transaction_number)) \
+                + transaction_id + bytearray(command_payload)
+            encrypted_command = self._encrypt_secure_command_des(
+                command_code, secure_payload, credentials.session_key)
+        elif isinstance(credentials, Aes128SecureSessionCredentials):
+            encrypted_command = self._encrypt_secure_request_v2_aes128(
+                command_code, transaction_number, transaction_id,
+                credentials.challenge_3c, credentials.encryption_key,
+                credentials.mac_key, bytearray(command_payload))
+        else:
+            self._raise_protocol_error("unknown secure session scheme")
+
+        encrypted_response = self._send_without_response_idm(
+            command_code, encrypted_command, timeout)
+        response_code = (command_code + 1) & 0xFF
+
+        if isinstance(credentials, DesSecureSessionCredentials):
+            rsp_tn, response_payload = self._decrypt_secure_response_des(
+                response_code, transaction_id, credentials.session_key,
+                encrypted_response)
+        elif isinstance(credentials, Aes128SecureSessionCredentials):
+            rsp_tn, response_payload = self._decrypt_secure_response_v2_aes128(
+                response_code, transaction_id, credentials.challenge_3c,
+                credentials.encryption_key, credentials.mac_key,
+                encrypted_response)
+        else:
+            self._raise_protocol_error("unknown secure session scheme")
+
+        context = self._ensure_authenticated_context()
+        if rsp_tn <= context.transaction_number:
+            self._raise_protocol_error("secure response transaction number did not advance")
+        context.transaction_number = rsp_tn
+        return response_payload
+
+    def secure_transceive(
+            self, command_code: int, command_payload: Octets,
+            timeout: float) -> bytearray:
+        """Encrypt an arbitrary command, transceive it, and return the response.
+
+        The *command_code* and *command_payload* are encrypted under the
+        active secure session, sent to the card, and the decrypted response
+        payload is returned. This is the low-level primitive behind the typed
+        secure commands (:meth:`read`, :meth:`write`, ...) and is exposed for
+        callers that need to drive arbitrary secure commands (for example a
+        remote crypto oracle that holds the keys while a separate client owns
+        the reader). Requires a prior :meth:`mutual_authentication` (or
+        :meth:`mutual_authentication_v2`).
+
+        """
+        return self._secure_command_exchange(
+            command_code, command_payload, timeout)
 
     def _is_present(self):
         # Perform a presence check. Modern FeliCa cards implement the
@@ -246,15 +910,14 @@ class FelicaStandard(tt3.Type3Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
-        a, b, e = self.pmm[2] & 7, self.pmm[2] >> 3 & 7, self.pmm[2] >> 6
-        timeout = 302E-6 * ((b + 1) * len(service_list) + a + 1) * 4**e
+        timeout = self._scaled_timeout(
+            self.REQUEST_SERVICE_PMMSLOT, len(service_list))
         pack = lambda x: x.pack()  # noqa: E731
         data = bytearray([len(service_list)]) \
             + b''.join(map(pack, service_list))
-        data = self.send_cmd_recv_rsp(0x02, data, timeout, check_status=False)
-        if len(data) != 1 + len(service_list) * 2:
-            log.debug("insufficient data received from tag")
-            raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
+        data = self._send_standard_command(
+            self.REQUEST_SERVICE_CMD, data, timeout)
+        self._validate_exact_length(data, 1 + len(service_list) * 2)
         return [unpack("<H", data[i:i+2])[0] for i in range(1, len(data), 2)]
 
     def request_response(self):
@@ -272,12 +935,10 @@ class FelicaStandard(tt3.Type3Tag):
         :exc:`~nfc.tag.TagCommandError`.
 
         """
-        a, b, e = self.pmm[3] & 7, self.pmm[3] >> 3 & 7, self.pmm[3] >> 6
-        timeout = 302E-6 * (b + 1 + a + 1) * 4**e
-        data = self.send_cmd_recv_rsp(0x04, b'', timeout, check_status=False)
-        if len(data) != 1:
-            log.debug("insufficient data received from tag")
-            raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
+        timeout = self._scaled_timeout(self.REQUEST_RESPONSE_PMMSLOT, 1)
+        data = self._send_standard_command(
+            self.REQUEST_RESPONSE_CMD, b'', timeout)
+        self._validate_exact_length(data, 1)
         return data[0]  # mode
 
     def search_service_code(self, service_index):
@@ -316,10 +977,11 @@ class FelicaStandard(tt3.Type3Tag):
         # The maximum response time is given by the value of PMM[3].
         # Some cards (like RC-S860 with IC RC-S915) encode a value
         # that is too short, thus we use at lest 2 ms.
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
-        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
+        timeout = self._base_timeout(
+            self.SEARCH_SERVICE_CODE_PMMSLOT, enforce_min=True)
         data = pack("<H", service_index)
-        data = self.send_cmd_recv_rsp(0x0A, data, timeout, check_status=False)
+        data = self._send_standard_command(
+            self.SEARCH_SERVICE_CODE_CMD, data, timeout)
         if data != b"\xFF\xFF":
             unpack_format = "<H" if len(data) == 2 else "<HH"
             return unpack(unpack_format, data)
@@ -340,13 +1002,854 @@ class FelicaStandard(tt3.Type3Tag):
 
         """
         log.debug("request system code list")
-        a, e = self.pmm[3] & 7, self.pmm[3] >> 6
-        timeout = max(302E-6 * (a + 1) * 4**e, 0.002)
-        data = self.send_cmd_recv_rsp(0x0C, b'', timeout, check_status=False)
-        if len(data) != 1 + data[0] * 2:
-            log.debug("insufficient data received from tag")
-            raise tt3.Type3TagCommandError(tt3.DATA_SIZE_ERROR)
+        timeout = self._base_timeout(
+            self.REQUEST_SYSTEM_CODE_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.REQUEST_SYSTEM_CODE_CMD, b'', timeout)
+        self._validate_exact_length(data, 1 + data[0] * 2)
         return [unpack(">H", data[i:i+2])[0] for i in range(1, len(data), 2)]
+
+    def request_block_information(
+            self, node_code_list: Sequence[int]) -> List[int]:
+        """Return assigned block counts for node codes.
+
+        The *node_code_list* argument must provide one or more
+        16-bit integers. The return value is a list of 16-bit block
+        counts in the same order as requested.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._scaled_timeout(
+            self.REQUEST_BLOCK_INFORMATION_PMMSLOT,
+            len(node_code_list), enforce_min=True)
+        data = bytearray([len(node_code_list)]) \
+            + b''.join([pack("<H", x) for x in node_code_list])
+        data = self._send_standard_command(
+            self.REQUEST_BLOCK_INFORMATION_CMD, data, timeout)
+        self._validate_min_length(data, 1)
+        self._validate_exact_length(data, 1 + data[0] * 2)
+        return [unpack("<H", data[i:i+2])[0] for i in range(1, len(data), 2)]
+
+    def request_block_information_ex(
+            self, node_code_list: Sequence[int]) -> Tuple[List[int], List[int]]:
+        """Return assigned and free block counts for node codes.
+
+        The *node_code_list* argument must provide one or more
+        16-bit integers. The return value is a tuple
+        ``(assigned_block_counts, free_block_counts)``.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._scaled_timeout(
+            self.REQUEST_BLOCK_INFORMATION_EX_PMMSLOT,
+            len(node_code_list), enforce_min=True)
+        data = bytearray([len(node_code_list)]) \
+            + b''.join([pack("<H", x) for x in node_code_list])
+        data = self._send_standard_command(
+            self.REQUEST_BLOCK_INFORMATION_EX_CMD, data, timeout)
+
+        self._validate_min_length(data, 2)
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+
+        self._validate_min_length(data, 3)
+        count = data[2]
+        self._validate_exact_length(data, 3 + count * 4)
+
+        assigned, free = list(), list()
+        for i in range(count):
+            offset = 3 + i * 4
+            assigned.append(unpack("<H", data[offset:offset+2])[0])
+            free.append(unpack("<H", data[offset+2:offset+4])[0])
+        return assigned, free
+
+    def request_code_list(
+            self, parent_node_code: int,
+            index: int) -> Tuple[bool, List[AreaCodeRange], List[int]]:
+        """Return area and service codes under a parent node code.
+
+        The return value is a tuple
+        ``(continue_flag, area_code_ranges, service_codes)`` where
+        *area_code_ranges* is a list of ``(area_code, area_last)``
+        tuples and *service_codes* is a list of 16-bit integers.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.REQUEST_CODE_LIST_PMMSLOT, enforce_min=True)
+        data = pack("<HH", parent_node_code, index)
+        data = self._send_standard_command(self.REQUEST_CODE_LIST_CMD, data, timeout)
+
+        self._validate_min_length(data, 2)
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+
+        self._validate_min_length(data, 5)
+        continue_flag = bool(data[2])
+        area_count = data[3]
+        offset = 4
+        self._validate_min_length(data, offset + area_count * 4 + 1)
+
+        area_code_ranges = list()
+        for i in range(area_count):
+            area_data = data[offset+i*4:offset+(i+1)*4]
+            area_code_ranges.append(unpack("<HH", area_data))
+        offset = offset + area_count * 4
+
+        service_count = data[offset]
+        offset = offset + 1
+        self._validate_exact_length(data, offset + service_count * 2)
+
+        service_codes = list()
+        for i in range(service_count):
+            service_codes.append(
+                unpack("<H", data[offset+i*2:offset+(i+1)*2])[0])
+
+        return continue_flag, area_code_ranges, service_codes
+
+    def set_parameter(self, encryption_type: int, packet_type: int) -> None:
+        """Configure secure messaging parameters.
+
+        Valid values for *encryption_type* are 0 or 1 and valid
+        values for *packet_type* are 0 or 1.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.SET_PARAMETER_PMMSLOT, enforce_min=True)
+        data = bytearray([0, 0, 0, 0, encryption_type, packet_type, 0, 0])
+        data = self._send_standard_command(self.SET_PARAMETER_CMD, data, timeout)
+        self._validate_exact_length(data, 2)
+
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0 or status_flag2 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+
+    def get_container_issue_information(self) -> Dict[str, bytearray]:
+        """Return container issue information.
+
+        The return value is a dictionary with the keys
+        ``format_version_carrier_information`` and
+        ``mobile_phone_model_information``.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.GET_CONTAINER_ISSUE_INFORMATION_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.GET_CONTAINER_ISSUE_INFORMATION_CMD, b'\x00\x00', timeout)
+        self._validate_exact_length(data, 16)
+        return {
+            "format_version_carrier_information": data[0:5],
+            "mobile_phone_model_information": data[5:16]
+        }
+
+    def get_container_property(self, property_index: int) -> bytearray:
+        """Return raw bytes of the selected container property."""
+        timeout = self._base_timeout(
+            self.GET_CONTAINER_PROPERTY_PMMSLOT, enforce_min=True)
+        data = self.send_cmd_recv_rsp(
+            self.GET_CONTAINER_PROPERTY_CMD, pack("<H", property_index), timeout,
+            send_idm=False, check_status=False)
+        self._validate_min_length(data, 1)
+        return data
+
+    def get_container_id(self) -> bytearray:
+        """Return the current container IDm as an 8-byte bytearray."""
+        timeout = self._base_timeout(
+            self.GET_CONTAINER_ID_PMMSLOT, enforce_min=True)
+        data = self.send_cmd_recv_rsp(
+            self.GET_CONTAINER_ID_CMD, b'\x00\x00', timeout,
+            send_idm=False, check_status=False)
+        self._validate_exact_length(data, 8)
+        return data
+
+    def get_system_status(self) -> Tuple[int, bytearray]:
+        """Return system status information.
+
+        The return value is a tuple ``(flag, data)`` where *data* is
+        a bytearray.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.GET_SYSTEM_STATUS_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.GET_SYSTEM_STATUS_CMD, b'\x00\x00', timeout)
+
+        self._validate_status_flags(data)
+        self._validate_min_length(data, 4)
+
+        flag, data_len = data[2], data[3]
+        self._validate_exact_length(data, 4 + data_len)
+        return flag, data[4:4+data_len]
+
+    def request_product_information(self) -> bytearray:
+        """Return product information bytes.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.REQUEST_PRODUCT_INFORMATION_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.REQUEST_PRODUCT_INFORMATION_CMD, b'', timeout)
+
+        self._validate_status_flags(data)
+        self._validate_min_length(data, 3)
+
+        data_len = data[2]
+        self._validate_exact_length(data, 3 + data_len)
+        return data[3:3+data_len]
+
+    def request_specification_version(self) -> Optional[SpecificationVersion]:
+        """Return specification version information.
+
+        The return value is either :const:`None` or a
+        :class:`SpecificationVersion` with ``format_version``,
+        ``basic_version`` and ``option_versions``. The individual option
+        versions can also be accessed by name, e.g.
+        :attr:`~SpecificationVersion.random_id_option_version`.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.REQUEST_SPECIFICATION_VERSION_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.REQUEST_SPECIFICATION_VERSION_CMD, b'\x00\x00', timeout)
+
+        self._validate_min_length(data, 2)
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+        if len(data) == 2:
+            return None
+
+        version_data = data[2:]
+        self._validate_min_length(version_data, 4)
+        option_count = version_data[3]
+        self._validate_exact_length(version_data, 4 + option_count * 2)
+
+        option_versions = list()
+        for i in range(option_count):
+            offset = 4 + i * 2
+            option_versions.append(
+                self._parse_option_version(version_data[offset:offset+2]))
+
+        return SpecificationVersion(
+            format_version=version_data[0],
+            basic_version=self._parse_option_version(version_data[1:3]),
+            option_versions=option_versions,
+        )
+
+    def reset_mode(self) -> None:
+        """Reset the operating mode of the card.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.RESET_MODE_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.RESET_MODE_CMD, b'\x00\x00', timeout)
+        self._validate_exact_length(data, 2)
+
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0 or status_flag2 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+
+    def get_area_information(self, node_code: int) -> Tuple[int, bytearray]:
+        """Return information of an area node code.
+
+        The return value is a tuple ``(node_code, data)`` where
+        *data* is a two-byte bytearray.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._base_timeout(
+            self.GET_AREA_INFORMATION_PMMSLOT, enforce_min=True)
+        data = self._send_standard_command(
+            self.GET_AREA_INFORMATION_CMD, pack("<H", node_code), timeout)
+
+        self._validate_min_length(data, 2)
+        status_flag1, status_flag2 = data[0], data[1]
+        if status_flag1 != 0:
+            self._raise_status_flag_error(status_flag1, status_flag2)
+
+        self._validate_exact_length(data, 6)
+        area_node_code = unpack("<H", data[2:4])[0]
+        return area_node_code, data[4:6]
+
+    def get_node_property(
+            self, node_property_type: int,
+            node_code_list: Sequence[int]) -> List[NodeProperty]:
+        """Return properties for a list of node codes.
+
+        If *node_property_type* is 0x00 (value-limited purse service),
+        each list entry is a dictionary with
+        ``enabled``, ``upper_limit``, ``lower_limit``, and
+        ``generation_number``.
+        If *node_property_type* is 0x01 (MAC communication), each list
+        entry is a dictionary with only ``enabled``.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._scaled_timeout(
+            self.GET_NODE_PROPERTY_PMMSLOT,
+            max(1, min(len(node_code_list), 16)), enforce_min=True)
+        data = bytearray([node_property_type, len(node_code_list)]) \
+            + b''.join([pack("<H", x) for x in node_code_list])
+        data = self._send_standard_command(self.GET_NODE_PROPERTY_CMD, data, timeout)
+
+        self._validate_status_flags(data)
+        self._validate_min_length(data, 3)
+
+        node_count = data[2]
+        if node_count != len(node_code_list):
+            self._raise_data_size_error()
+
+        if node_property_type == self.NODE_PROPERTY_VALUE_LIMITED_PURSE_SERVICE:
+            self._validate_exact_length(data, 3 + node_count * 10)
+            properties = list()
+            for i in range(node_count):
+                offset = 3 + i * 10
+                properties.append({
+                    "enabled": data[offset] == 0x01,
+                    "upper_limit": unpack("<i", data[offset+1:offset+5])[0],
+                    "lower_limit": unpack("<i", data[offset+5:offset+9])[0],
+                    "generation_number": data[offset+9]
+                })
+            return properties
+
+        if node_property_type == self.NODE_PROPERTY_MAC_COMMUNICATION:
+            self._validate_exact_length(data, 3 + node_count)
+            return [{"enabled": x == 0x01} for x in data[3:]]
+
+        if len(data) == 3 + node_count * 10:
+            properties = list()
+            for i in range(node_count):
+                offset = 3 + i * 10
+                properties.append({
+                    "enabled": data[offset] == 0x01,
+                    "upper_limit": unpack("<i", data[offset+1:offset+5])[0],
+                    "lower_limit": unpack("<i", data[offset+5:offset+9])[0],
+                    "generation_number": data[offset+9]
+                })
+            return properties
+
+        if len(data) == 3 + node_count:
+            return [{"enabled": x == 0x01} for x in data[3:]]
+
+        self._raise_data_size_error()
+
+    def request_service_v2(
+            self, service_list: Sequence[tt3.ServiceCode]
+            ) -> Tuple[int, List[ServiceVersion]]:
+        """Return service key version information (FeliCa Standard v2).
+
+        The return value is a tuple ``(crypto_id, key_versions)``.
+        If *crypto_id* is 0x41 or 0x43, key version entries are
+        ``(aes_key_version, des_key_version)`` tuples. Otherwise each
+        key version entry is a single 16-bit integer.
+
+        Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
+
+        """
+        timeout = self._scaled_timeout(
+            self.REQUEST_SERVICE_V2_PMMSLOT,
+            len(service_list), enforce_min=True)
+        pack_service = lambda x: x.pack()  # noqa: E731
+        data = bytearray([len(service_list)]) \
+            + b''.join(map(pack_service, service_list))
+        data = self._send_standard_command(self.REQUEST_SERVICE_V2_CMD, data, timeout)
+
+        self._validate_status_flags(data)
+        self._validate_min_length(data, 4)
+
+        crypto_id, node_count = data[2], data[3]
+        payload = data[4:]
+        if node_count != len(service_list):
+            self._raise_data_size_error()
+
+        if crypto_id in (
+                self.REQUEST_SERVICE_V2_DUAL_KEYS_AES128,
+                self.REQUEST_SERVICE_V2_DUAL_KEYS_AES_CMAC):
+            self._validate_exact_length(payload, node_count * 4)
+            key_versions = list()
+            for i in range(node_count):
+                aes_offset = i * 2
+                des_offset = node_count * 2 + aes_offset
+                aes_version = unpack("<H", payload[aes_offset:aes_offset+2])[0]
+                des_version = unpack("<H", payload[des_offset:des_offset+2])[0]
+                key_versions.append((aes_version, des_version))
+        else:
+            self._validate_exact_length(payload, node_count * 2)
+            key_versions = list()
+            for i in range(node_count):
+                offset = i * 2
+                key_versions.append(unpack("<H", payload[offset:offset+2])[0])
+
+        return crypto_id, key_versions
+
+    @staticmethod
+    def generate_service_keys_des(
+            system_key: Octets, area_keys: Sequence[Octets],
+            service_keys: Sequence[Octets]) -> Tuple[bytearray, bytearray]:
+        """Generate group and user service keys from key hierarchies."""
+        current_key = bytearray(system_key)
+        for key in area_keys:
+            current_key = FelicaStandard._encrypt_des_block(current_key, key)
+        group_service_key = current_key
+        for key in service_keys:
+            current_key = FelicaStandard._encrypt_des_block(current_key, key)
+        user_service_key = current_key
+        return group_service_key, user_service_key
+
+    @staticmethod
+    def generate_group_key_v2_aes128(node_keys: Sequence[Octets]) -> bytearray:
+        """Generate a FeliCa Standard v2 (AES-128) group key.
+
+        The *node_keys* argument is an ordered sequence of 16-byte node
+        (service) keys. Starting from a fixed initial chaining block, each
+        node key is folded in as an AES-128 key. The 16-byte group key is
+        returned.
+
+        """
+        current_key = bytearray(FelicaStandard.V2_AES128_NODE_KEY_INIT)
+        for key in node_keys:
+            current_key = FelicaStandard._encrypt_aes128_block(current_key, key)
+        return current_key
+
+    def authenticated_context(self) -> Optional[AuthenticatedContext]:
+        """Return current secure session context or :const:`None`."""
+        if self._authenticated_context is None:
+            return None
+        return self._clone_authenticated_context(self._authenticated_context)
+
+    def set_authenticated_context(
+            self, context: AuthenticatedContext) -> None:
+        """Set secure session context.
+
+        The *context* argument must be an :class:`AuthenticatedContext`
+        instance.
+
+        """
+        self._authenticated_context = self._normalize_authenticated_context(context)
+
+    def clear_authenticated_context(self) -> None:
+        """Clear secure session context."""
+        self._authenticated_context = None
+
+    def authenticated_scheme(self) -> Optional[SecureSessionScheme]:
+        """Return current secure session scheme or :const:`None`."""
+        if self._authenticated_context is None:
+            return None
+        return self._authenticated_context.scheme
+
+    def authentication1(
+            self, areas: Sequence[int], services: Sequence[tt3.ServiceCode],
+            challenge_1a: Octets) -> Tuple[bytearray, bytearray]:
+        """Perform FeliCa Standard Authentication1 command.
+
+        The *areas* argument is a list of 16-bit area codes.
+        The *services* argument is a list of
+        :class:`~nfc.tag.tt3.ServiceCode` objects.
+        The *challenge_1a* argument must be 8 bytes.
+
+        Returns a tuple ``(challenge_1b, challenge_2a)``.
+
+        """
+        if len(challenge_1a) != 8:
+            raise ValueError("challenge_1a must be 8 bytes")
+        timeout = self._scaled_timeout(
+            self.AUTHENTICATION1_PMMSLOT, len(areas) + len(services),
+            enforce_min=True)
+        service_codes = [int(service) for service in services]
+        data = bytearray([len(areas)]) \
+            + b''.join([pack("<H", area) for area in areas]) \
+            + bytearray([len(service_codes)]) \
+            + b''.join([pack("<H", code) for code in service_codes]) \
+            + bytearray(challenge_1a)
+        data = self._send_standard_command(self.AUTHENTICATION1_CMD, data, timeout)
+        self._validate_exact_length(data, 16)
+        return data[0:8], data[8:16]
+
+    def authentication2(self, challenge_2b: Octets) -> bytearray:
+        """Perform FeliCa Standard Authentication2 command.
+
+        The *challenge_2b* argument must be 8 bytes.
+        Returns encrypted response payload bytes.
+
+        """
+        if len(challenge_2b) != 8:
+            raise ValueError("challenge_2b must be 8 bytes")
+        timeout = self._base_timeout(self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
+        data = self._send_command_with_idm_no_idm_response(
+            self.AUTHENTICATION2_CMD, bytearray(challenge_2b), timeout)
+        self._validate_min_length(data, 8)
+        return data
+
+    def _decrypt_authentication2_payload_des(
+            self, encrypted_payload: Octets, session_key: Octets) -> bytearray:
+        plain = self._decrypt_des_cbc_zero_iv(encrypted_payload, session_key)
+        if self._check_packet_mac_des(
+                plain, self.AUTHENTICATION2_CMD + 1) is False:
+            self._raise_protocol_error(
+                "authentication2 response MAC verification failed")
+        if len(plain) < 8:
+            self._raise_protocol_error(
+                "authentication2 response payload too short")
+        return plain[:-8]
+
+    def mutual_authentication(
+            self, areas: Sequence[int], services: Sequence[tt3.ServiceCode],
+            group_service_key: Octets,
+            user_service_key: Octets) -> Tuple[bytearray, bytearray]:
+        """Perform DES mutual authentication and open a secure session.
+
+        Returns a tuple ``(issue_id, issue_parameter)``.
+
+        """
+        if len(areas) == 0 and len(services) == 0:
+            raise ValueError(
+                "mutual authentication requires at least one area or service")
+        if len(group_service_key) != 8 or len(user_service_key) != 8:
+            raise ValueError("service keys must be 8 bytes")
+
+        random_1 = bytearray(os.urandom(8))
+        key_l = self._xor_bytes(group_service_key, self.idm[0:8])
+        alpha = self._encrypt_des_block(user_service_key, key_l)
+        beta = self._encrypt_des_block(key_l, alpha)
+
+        challenge_1a = self._encrypt_3des_block(random_1, alpha, key_l)
+        challenge_1b, challenge_2a = self.authentication1(
+            areas, services, challenge_1a)
+
+        if self._encrypt_3des_block(random_1, key_l, beta) != challenge_1b:
+            self._raise_authentication_error(
+                "Authentication1 verification failed")
+
+        random_2 = self._decrypt_3des_block(challenge_2a, key_l, beta)
+        challenge_2b = self._encrypt_3des_block(random_2, alpha, key_l)
+        encrypted_payload = self.authentication2(challenge_2b)
+        payload = self._decrypt_authentication2_payload_des(
+            encrypted_payload, random_2)
+        if len(payload) < 24:
+            self._raise_protocol_error(
+                "Authentication2 response payload too short")
+
+        transaction_number = unpack("<H", payload[0:2])[0]
+        transaction_id = payload[2:8]
+        expected_transaction_id = random_1[2:8]
+        if transaction_id != expected_transaction_id:
+            self._raise_authentication_error(
+                "Authentication2 transaction ID mismatch")
+
+        issue_id = payload[8:16]
+        issue_parameter = payload[16:24]
+        self._authenticated_context = AuthenticatedContext(
+            transaction_number=transaction_number,
+            transaction_id=transaction_id,
+            credentials=DesSecureSessionCredentials(random_2),
+        )
+        return issue_id, issue_parameter
+
+    @staticmethod
+    def _pack_block_list(block_list: Sequence[tt3.BlockCode]) -> bytes:
+        return b''.join([block.pack() for block in block_list])
+
+    def _build_block_command_payload(
+            self, block_list: Sequence[tt3.BlockCode],
+            block_data: Optional[Octets] = None) -> bytearray:
+        payload = bytearray([len(block_list)])
+        payload.extend(self._pack_block_list(block_list))
+        if block_data is not None:
+            payload.extend(bytearray(block_data))
+        return payload
+
+    def _parse_secure_read_result(
+            self, data: Octets, expected_blocks: int) -> List[bytearray]:
+        self._validate_status_flags(data, min_length=2)
+        self._validate_min_length(data, 3)
+        block_count = data[2]
+        expected_length = 3 + block_count * 16
+        self._validate_min_length(data, expected_length)
+        if block_count != expected_blocks:
+            self._raise_data_size_error()
+        return [
+            bytearray(data[3+i*16:3+(i+1)*16])
+            for i in range(block_count)
+        ]
+
+    def _secure_read(
+            self, command_code: int,
+            block_list: Sequence[tt3.BlockCode]) -> List[bytearray]:
+        timeout = self._scaled_timeout(
+            self.READ_PMMSLOT, len(block_list), enforce_min=True)
+        payload = self._build_block_command_payload(block_list)
+        data = self._secure_command_exchange(command_code, payload, timeout)
+        return self._parse_secure_read_result(data, len(block_list))
+
+    def read(self, block_list: Sequence[tt3.BlockCode]) -> List[bytearray]:
+        """Read data blocks with secure messaging."""
+        return self._secure_read(self.READ_CMD, block_list)
+
+    def read_v2(self, block_list: Sequence[tt3.BlockCode]) -> List[bytearray]:
+        """Read data blocks with secure messaging v2."""
+        return self._secure_read(self.READ_V2_CMD, block_list)
+
+    def _secure_write(
+            self, command_code: int, block_list: Sequence[tt3.BlockCode],
+            data: Octets) -> None:
+        if len(data) != len(block_list) * 16:
+            raise ValueError("data length must be 16 * len(block_list)")
+        timeout = self._scaled_timeout(
+            self.WRITE_PMMSLOT, len(block_list), enforce_min=True)
+        payload = self._build_block_command_payload(block_list, data)
+        rsp = self._secure_command_exchange(command_code, payload, timeout)
+        self._validate_exact_length(rsp, 2)
+        self._validate_status_flags(rsp, require_status_flag2_zero=True)
+
+    def write(self, block_list: Sequence[tt3.BlockCode], data: Octets) -> None:
+        """Write data blocks with secure messaging."""
+        self._secure_write(self.WRITE_CMD, block_list, data)
+
+    def write_v2(
+            self, block_list: Sequence[tt3.BlockCode], data: Octets) -> None:
+        """Write data blocks with secure messaging v2."""
+        self._secure_write(self.WRITE_V2_CMD, block_list, data)
+
+    def change_keys(self, change_key_params: Sequence[ChangeKeyParam]) -> None:
+        """Change service keys through secure Write command.
+
+        Each entry in *change_key_params* must provide the keys
+        ``parent_key``, ``new_key``, ``old_key``, and ``new_key_version``.
+
+        """
+        if len(change_key_params) == 0:
+            raise ValueError("change_keys requires at least one entry")
+        block_list = list()
+        payload = bytearray()
+        for params in change_key_params:
+            parent_key = params["parent_key"]
+            new_key = params["new_key"]
+            old_key = params["old_key"]
+            new_key_version = params["new_key_version"]
+            if len(parent_key) != 8 or len(new_key) != 8 or len(old_key) != 8:
+                raise ValueError("all key values must be 8 bytes")
+
+            version_block = bytearray(8)
+            version_block[6:8] = pack("<H", new_key_version)
+
+            parameter1 = self._encrypt_des_block(version_block, new_key)
+            parameter1 = self._encrypt_des_block(parameter1, old_key)
+            parameter1 = self._encrypt_des_block(parameter1, parent_key)
+
+            parameter2 = self._encrypt_des_block(new_key, old_key)
+            parameter2 = self._encrypt_des_block(parameter2, parent_key)
+
+            payload.extend(parameter1)
+            payload.extend(parameter2)
+            block_list.append(tt3.BlockCode(new_key_version, access=4, service=0))
+
+        self.write(block_list, payload)
+
+    def authentication1_v2(
+            self, operation_parameter: int, nodes: Sequence[int],
+            challenge_1a: Octets) -> Tuple[bytearray, bytearray, bytearray]:
+        """Perform FeliCa Standard v2 Authentication1 command.
+
+        Returns a tuple ``(challenge_1b, challenge_2a, challenge_3c)``.
+
+        """
+        if len(challenge_1a) != 16:
+            raise ValueError("challenge_1a must be 16 bytes")
+        timeout = self._scaled_timeout(
+            self.AUTHENTICATION1_PMMSLOT, len(nodes), enforce_min=True)
+        payload = bytearray([operation_parameter, len(nodes)]) \
+            + b''.join([pack("<H", node) for node in nodes]) \
+            + bytearray(challenge_1a)
+        data = self._send_standard_command(self.AUTHENTICATION1_V2_CMD, payload, timeout)
+        self._validate_exact_length(data, 36)
+        return data[0:16], data[16:32], data[32:36]
+
+    def authentication2_v2(self, challenge_2b: Octets) -> bytearray:
+        """Perform FeliCa Standard v2 Authentication2 command.
+
+        Returns encrypted response payload bytes.
+
+        """
+        if len(challenge_2b) != 16:
+            raise ValueError("challenge_2b must be 16 bytes")
+        timeout = self._base_timeout(self.AUTHENTICATION2_PMMSLOT, enforce_min=True)
+        data = self._send_command_with_idm_no_idm_response(
+            self.AUTHENTICATION2_V2_CMD, bytearray(challenge_2b), timeout)
+        self._validate_min_length(data, 10)
+        return data
+
+    def _build_authentication_context_block_v2(
+            self, prefix: Sequence[int], idm: Octets) -> bytearray:
+        block = bytearray(16)
+        block[0:2] = bytearray(prefix)
+        block[6:14] = bytearray(idm)
+        block[14:16] = self.V2_AES128_AUTH_CONTEXT_SUFFIX
+        return block
+
+    def mutual_authentication_v2(
+            self, operation_parameter: int, nodes: Sequence[int],
+            group_key: Octets, individual_key: Octets
+            ) -> Tuple[bytearray, bytearray]:
+        """Perform AES-128 mutual authentication and open a v2 session.
+
+        Returns a tuple ``(issue_id, issue_parameter)``.
+
+        """
+        if len(nodes) == 0:
+            raise ValueError(
+                "mutual authentication v2 requires at least one node code")
+        if len(group_key) != 16 or len(individual_key) != 16:
+            raise ValueError("group_key and individual_key must be 16 bytes")
+
+        random_1 = bytearray(os.urandom(16))
+        h = self._xor_bytes(group_key, individual_key)
+        alpha = self._encrypt_aes128_block(
+            self._build_authentication_context_block_v2([0x01, 0x02], self.idm[0:8]), h)
+        beta = self._encrypt_aes128_block(
+            self._build_authentication_context_block_v2([0x02, 0x02], self.idm[0:8]), h)
+
+        challenge_1a = self._encrypt_aes128_block(random_1, alpha)
+        challenge_1b, challenge_2a, challenge_3c = self.authentication1_v2(
+            operation_parameter, nodes, challenge_1a)
+
+        beta_mask = bytearray(16)
+        beta_mask[0:4] = challenge_3c
+        beta_with_3c = self._xor_bytes(beta, beta_mask)
+        if self._encrypt_aes128_block(random_1, beta_with_3c) != challenge_1b:
+            self._raise_authentication_error("Authentication1 v2 verification failed")
+
+        random_2 = self._decrypt_aes128_block(challenge_2a, beta_with_3c)
+        challenge_2b = self._encrypt_aes128_block(random_2, alpha)
+        encrypted_payload = self.authentication2_v2(challenge_2b)
+        transaction_id = random_1[2:8]
+        encryption_key = self._encrypt_aes128_block(
+            self.V2_AES128_DERIVE_ENCRYPTION_KEY_INPUT, random_2)
+        mac_key = self._encrypt_aes128_block(
+            self.V2_AES128_DERIVE_MAC_KEY_INPUT, random_2)
+        transaction_number, payload = self._decrypt_secure_response_v2_aes128(
+            self.AUTHENTICATION2_V2_CMD + 1, transaction_id, challenge_3c,
+            encryption_key, mac_key, encrypted_payload)
+        if len(payload) < 16:
+            self._raise_protocol_error("Authentication2 v2 response payload too short")
+
+        issue_id = payload[0:8]
+        issue_parameter = payload[8:16]
+        self._authenticated_context = AuthenticatedContext(
+            transaction_number=transaction_number,
+            transaction_id=transaction_id,
+            credentials=Aes128SecureSessionCredentials(
+                encryption_key=encryption_key,
+                mac_key=mac_key,
+                challenge_3c=challenge_3c,
+            ),
+        )
+        return issue_id, issue_parameter
+
+    def _generate_registration_package_des(
+            self, package_plain: Octets, package_key: Octets) -> bytearray:
+        if len(package_plain) == 0 or len(package_plain) % 8 != 0:
+            raise ValueError("registration package must be multiple of 8 bytes")
+        if len(package_key) != 8:
+            raise ValueError("package_key must be 8 bytes")
+
+        mac_key = bytearray([x ^ 0xFF for x in bytearray(package_key)])
+        encrypted_plain = self._encrypt_des_cbc_zero_iv(package_plain, mac_key)
+        if len(encrypted_plain) < 8:
+            self._raise_protocol_error("registration package MAC calculation failed")
+        mac = encrypted_plain[-8:]
+        return self._encrypt_des_cbc_zero_iv(bytearray(package_plain) + mac, package_key)
+
+    def register_issue_id(
+            self, system_code: int, area0_key_version: int, area0_key: Octets,
+            issue_id: Octets, issue_parameter: Octets, package_key: Octets
+            ) -> int:
+        """Run Register Issue ID secure command.
+
+        Returns remaining block count.
+
+        """
+        if len(area0_key) != 8 or len(issue_id) != 8 or len(issue_parameter) != 8:
+            raise ValueError("area0_key, issue_id and issue_parameter must be 8 bytes")
+        package_plain = bytearray(pack(">H", system_code)) \
+            + bytearray(pack("<H", area0_key_version)) \
+            + bytearray(area0_key) + bytearray(4)
+        package = self._generate_registration_package_des(package_plain, package_key)
+
+        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        payload = bytearray(issue_id) + bytearray(issue_parameter) + package
+        data = self._secure_command_exchange(self.REGISTER_ISSUE_ID_CMD, payload, timeout)
+        self._validate_status_flags(data)
+        return unpack("<H", data[2:4])[0]
+
+    def register_area(
+            self, area_code: int, service_code_range: Tuple[int, int],
+            size: int, key_version: int, area_key: Octets,
+            package_key: Octets) -> None:
+        """Run Register Area secure command."""
+        service_begin, service_end = service_code_range
+        if area_code != service_begin:
+            raise ValueError("area_code must match service_code_range start")
+        if len(area_key) != 8:
+            raise ValueError("area_key must be 8 bytes")
+
+        package_plain = bytearray(pack("<HHHH", service_begin, service_end, size, key_version))
+        package_plain.extend(bytearray(area_key))
+        package = self._generate_registration_package_des(package_plain, package_key)
+
+        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        payload = bytearray(pack("<H", area_code)) + package
+        data = self._secure_command_exchange(self.REGISTER_AREA_CMD, payload, timeout)
+        self._validate_status_flags(data, require_status_flag2_zero=True)
+
+    def register_service(
+            self, service_code: int, size: int, key_version: int,
+            service_key: Octets, package_key: Octets) -> int:
+        """Run Register Service secure command.
+
+        Returns remaining block count.
+
+        """
+        if len(service_key) != 8:
+            raise ValueError("service_key must be 8 bytes")
+
+        package_plain = bytearray(pack("<H", service_code))
+        package_plain.extend(bytearray(2))
+        package_plain.extend(bytearray(pack("<H", size)))
+        package_plain.extend(bytearray(pack("<H", key_version)))
+        package_plain.extend(bytearray(service_key))
+        package = self._generate_registration_package_des(package_plain, package_key)
+
+        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        payload = bytearray(pack("<H", service_code)) + package
+        data = self._secure_command_exchange(self.REGISTER_SERVICE_CMD, payload, timeout)
+        self._validate_status_flags(data)
+        return unpack("<H", data[2:4])[0]
+
+    def change_system_block(self) -> None:
+        """Run Change System Block secure command."""
+        timeout = self._base_timeout(self.REGISTRATION_PMMSLOT, enforce_min=True)
+        data = self._secure_command_exchange(self.CHANGE_SYSTEM_BLOCK_CMD, b'', timeout)
+        self._validate_status_flags(data, require_status_flag2_zero=True)
 
 
 class FelicaMobile(FelicaStandard):
@@ -481,7 +1984,7 @@ class FelicaLite(tt3.Type3Tag):
     def generate_mac(data, key, iv, flip_key=False):
         # Data is first split into tuples of 8 character bytes, each
         # tuple then reversed and joined, finally all joined back to
-        # one string that is then triple des encrypted with key and
+        # one string that is then 3DES encrypted with key and
         # initialization vector iv. If flip_key is True then the key
         # halfs will be exchanged (this is used to generate a mac for
         # write). The resulting mac is the last 8 bytes returned in
@@ -493,7 +1996,8 @@ class FelicaLite(tt3.Type3Tag):
             if isinstance(x[0], int)
             else b''.join(reversed(x))
             for x in zip(*[iter(bytes(data))]*8)])
-        return bytearray(triple_des(key, CBC, bytes(iv)).encrypt(txt)[:-9:-1])
+        mac = FelicaStandard._encrypt_3des_cbc(txt, key, iv)
+        return bytearray(mac[-8:][::-1])
 
     def protect(self, password=None, read_protect=False, protect_from=0):
         """Protect a FeliCa Lite Tag.
@@ -601,10 +2105,10 @@ class FelicaLite(tt3.Type3Tag):
         log.debug("rc2 = {}".format(hexlify(rc[8:]).decode()))
         self.write_without_mac(rc[7::-1] + rc[15:7:-1], 0x80)
 
-        # The session key becomes the triple_des encryption of the random
+        # The session key becomes the 3DES encryption of the random
         # challenge under the card key and with an initialization vector of
         # all zero.
-        sk = triple_des(key, CBC, b'\00' * 8).encrypt(rc)
+        sk = FelicaStandard._encrypt_3des_cbc(rc, key, b"\x00" * 8)
         log.debug("sk1 = {}".format(hexlify(sk[:8]).decode()))
         log.debug("sk2 = {}".format(hexlify(sk[8:]).decode()))
 

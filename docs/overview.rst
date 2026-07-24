@@ -5,7 +5,7 @@ Overview
 Requirements
 ============
 
-* `Python`_ version 2.7 or 3.5 or newer
+* `Python`_ version 3.8 or newer
 * Python `usb1`_ module to access USB devices through `libusb`_
 * Python `serial`_ module to access serial (incl. FTDI) devices
 * Python `docopt`_ module for some of the example programs
