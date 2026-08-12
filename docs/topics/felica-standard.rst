@@ -31,6 +31,17 @@ answers with an error status or with a malformed response. Arguments
 that can not produce a valid command frame raise :exc:`ValueError`
 before anything is sent.
 
+Status flag 1 of a response decides whether a command succeeded, and
+status flag 2 only details why a failure happened. A non-zero status
+flag 2 alongside a normal completion is a warning that is logged and
+not turned into an error; the memory rewrite count warning ``0x71`` in
+particular is raised *after* a write has been performed, and treating
+it as a failure would invite a caller to repeat a write that already
+happened. When status flag 1 does report a failure, its value points
+at the list entry that failed, in one of two product dependent
+encodings that the response can not distinguish;
+:func:`status_flag1_description` renders both readings.
+
 Card and file system information
 ================================
 
@@ -187,6 +198,22 @@ Note that a context only stays valid as long as the card keeps the
 session, and that the transaction number must keep advancing. It can
 not be reused after the card has been reactivated.
 
+The context also records, as ``nodes``, the node list the session was
+opened against: the services of :meth:`~FelicaStandard.authentication1`
+for DES and the node list of
+:meth:`~FelicaStandard.authentication1_v2` for AES-128. A block list
+element names its target by position in that list, so the order has to
+be preserved. A context that is assembled by hand should be given the
+same list that was authenticated with; leaving it empty only means that
+node lookups fail, never that a wrong node is used.
+
+Session keys are kept out of the log output: the credentials and the
+context print the length of a key instead of its bytes, and
+:meth:`~FelicaStandard.clear_authenticated_context` overwrites the keys
+before dropping the context. That bounds how long key material lives,
+it does not eliminate it, because Python copies byte strings freely and
+an immutable :class:`bytes` object can not be overwritten at all.
+
 :meth:`~FelicaStandard.secure_transceive` sends an arbitrary command
 code and payload through the open session and returns the decrypted
 response payload. This is the primitive that
@@ -216,17 +243,26 @@ The register commands return the number of blocks still available. ::
    remaining = tag.register_service(0x1008, 4, 1, service_key, package_key)
    tag.change_system_block()
 
-Service keys are rotated with :meth:`~FelicaStandard.change_keys`,
-which sends the new key material through the secure Write command.
-Each entry needs the parent key, the new key, the old key, and the new
-key version. ::
+Node keys are rotated with :meth:`~FelicaStandard.change_keys`, which
+sends the new key material through the secure Write command. Each
+entry needs the node whose key is replaced, the parent key, the new
+key, the old key, and the new key version. ::
 
    tag.change_keys([{
+       "node": 0x1008,
        "parent_key": parent_key,
        "new_key": new_key,
        "old_key": old_key,
        "new_key_version": 2,
    }])
+
+The node must be one that the open session was authenticated against,
+because the block list element of the Write command names it by
+position in that list. A node the session does not cover raises
+:exc:`ValueError` rather than rewriting the key of whichever node does
+sit at the position. The system node ``0xFFFF`` is addressable like any
+other node when it was named among the services of
+:meth:`~FelicaStandard.mutual_authentication`.
 
 .. warning:: The issuance commands change the card permanently. A
    wrong key or an interrupted sequence can leave a card unusable.
@@ -249,8 +285,19 @@ Limit                   Applies to
 32 node codes           :meth:`~FelicaStandard.request_block_information`,
                         :meth:`~FelicaStandard.request_block_information_ex`
 16 node codes           :meth:`~FelicaStandard.get_node_property`
-255 block codes         :meth:`~FelicaStandard.read`,
-                        :meth:`~FelicaStandard.read_v2`,
-                        :meth:`~FelicaStandard.write`,
+14 block codes          :meth:`~FelicaStandard.read`
+15 block codes          :meth:`~FelicaStandard.read_v2`,
+                        :meth:`~nfc.tag.tt3.Type3Tag.read_without_encryption`
+255 block codes         :meth:`~FelicaStandard.write`,
                         :meth:`~FelicaStandard.write_v2`
 ======================  =====================================================
+
+A block list is really bounded by what a single 255 byte packet holds,
+which is the value of the one byte data length field. A read is bounded
+by its *response* while its command stays small, so the block count is
+checked before the command is sent: a response holds 15 blocks for Read
+Without Encryption and Read v2, and 14 for the DES Read, which loses
+one block to the padding of its encryption. A write is bounded by its
+own command, whose length depends on whether the block list elements
+are two or three byte wide, and is therefore caught exactly when the
+command frame is built.

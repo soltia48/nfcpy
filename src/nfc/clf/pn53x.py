@@ -575,11 +575,15 @@ class Device(device.Device):
             raise ValueError(message)
 
         if not self.chipset.read_register("CIU_TxControl") & 0b00000011:
-            # Some FeliCa cards need more time from power up to
-            # polling. If the field was not already activated, do this
-            # now and wait about 5 ms.
+            # A card needs up to 20 ms from entering the field to being
+            # able to receive a command, and the card specification
+            # recommends holding the field for at least 20.4 ms, i.e. the
+            # 20 ms of start-up plus margin for the field's own rise time,
+            # before polling. Polling earlier is allowed but only if the
+            # caller retries, so polling once means waiting out the full
+            # time.
             self.chipset.rf_configuration(0x01, b'\x01')
-            time.sleep(0.005)
+            time.sleep(0.0204)
 
         default_sensf_req = bytearray.fromhex("00FFFF0100")
         sensf_req = target.sensf_req if target.sensf_req else default_sensf_req

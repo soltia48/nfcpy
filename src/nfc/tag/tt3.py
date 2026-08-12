@@ -34,6 +34,24 @@ log = logging.getLogger(__name__)
 
 RSP_LENGTH_ERROR, RSP_CODE_ERROR, TAG_IDM_ERROR, DATA_SIZE_ERROR = range(1, 5)
 
+# Maximum length of a FeliCa packet in bytes, counting the one byte data
+# length (LEN) field itself. The card specification defines LEN as a single
+# byte whose value is the packet data length plus one, so neither a command
+# nor a response can be longer than 255 byte.
+MAX_PACKET_LEN = 0xFF
+
+# Fixed part of a Read Without Encryption response: the LEN byte, the
+# response code, the IDm, both status flags and the block count.
+READ_WITHOUT_ENCRYPTION_RESPONSE_OVERHEAD = 1 + 1 + 8 + 1 + 1 + 1
+
+# Most blocks a single Read Without Encryption can return. The maximum is
+# product specific but no product can exceed what one response packet holds,
+# i.e. 16 byte per block on top of the fixed 13 byte header. Unlike a write,
+# a read is limited by its response while the command stays small, so the
+# request must be checked before it is sent.
+MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT = \
+    (MAX_PACKET_LEN - READ_WITHOUT_ENCRYPTION_RESPONSE_OVERHEAD) // 16
+
 
 class Type3TagCommandError(nfc.tag.TagCommandError):
     errno_str = {
@@ -554,6 +572,14 @@ class Type3Tag(nfc.tag.Tag):
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
         """
+        if len(block_list) > MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT:
+            # A read is bounded by its response rather than its command, so
+            # an over-long one would go out on the air and simply never be
+            # answerable.
+            raise ValueError(
+                "a Read Without Encryption response holds at most {0} "
+                "blocks".format(MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT))
+
         a, b, e = self.pmm[5] & 7, self.pmm[5] >> 3 & 7, self.pmm[5] >> 6
         timeout = 302.1E-6 * ((b + 1) * len(block_list) + a + 1) * 4**e
 
@@ -694,7 +720,18 @@ class Type3Tag(nfc.tag.Tag):
 
         """
         idm = self.idm if send_idm else bytearray()
-        cmd = bytearray([2+len(idm)+len(cmd_data), cmd_code]) + idm + cmd_data
+        packet_len = 2 + len(idm) + len(cmd_data)
+        if packet_len > MAX_PACKET_LEN:
+            # The LEN byte carries the packet data length plus one, so a
+            # longer packet cannot be announced. Sending it with a wrapped
+            # around length would put a frame on the air that every card
+            # answers with silence, because the received data length no
+            # longer matches the command's expected length.
+            raise ValueError(
+                "command packet would be {0} byte, but the one byte data "
+                "length field caps a packet at {1} byte"
+                .format(packet_len, MAX_PACKET_LEN))
+        cmd = bytearray([packet_len, cmd_code]) + idm + cmd_data
         log.debug(">> {0:02x} {1:02x} {2} {3} ({4}s)".format(
                 cmd[0], cmd[1], hexlify(cmd[2:10]).decode(),
                 hexlify(cmd[10:]).decode(), timeout))

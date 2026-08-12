@@ -42,6 +42,83 @@ SecureSessionScheme = str
 AreaCodeRange = Tuple[int, int]
 ServiceVersion = Union[int, Tuple[int, int]]
 
+# Fixed part of a secure read response payload: both status flags and the
+# block count, ahead of the block data itself.
+SECURE_READ_RESPONSE_OVERHEAD = 1 + 1 + 1
+
+# Transaction number and transaction ID of a DES secure messaging header.
+DES_SECURE_HEADER_SIZE = 2 + 6
+
+
+def _padded_to_des_block_size(length: int) -> int:
+    """Round up the way PKCS#7 padding does.
+
+    Between one and eight byte are always appended, so an already aligned
+    length grows by a full block.
+
+    """
+    return (length // 8 + 1) * 8
+
+
+def _max_secure_read_block_count() -> int:
+    """Most blocks a single DES Read can return.
+
+    A secure read is bounded by its response, not by its command: the
+    request stays small however many blocks it names, so an over-long one
+    would be sent and then be unanswerable. The response frame is ``LEN(1) +
+    response code(1) + E(txn(2) + txid(6) + SF1(1) + SF2(1) + n(1) + 16n) +
+    MAC(8)`` where ``E(..)`` is PKCS#7 padded to whole DES blocks.
+
+    """
+    blocks = 0
+    while True:
+        length = 2 + _padded_to_des_block_size(
+            DES_SECURE_HEADER_SIZE + SECURE_READ_RESPONSE_OVERHEAD
+            + (blocks + 1) * 16) + 8
+        if length > tt3.MAX_PACKET_LEN:
+            return blocks
+        blocks += 1
+
+
+def _max_secure_read_v2_block_count() -> int:
+    """Most blocks a single AES-128 Read v2 can return.
+
+    The v2 scheme encrypts with an OFB stream rather than a block cipher, so
+    its response frame carries no padding: ``LEN(1) + response code(1) +
+    counter(2) + SF1(1) + SF2(1) + n(1) + 16n + MAC(8)``. That leaves room
+    for one more block than the DES scheme.
+
+    """
+    return (tt3.MAX_PACKET_LEN
+            - (2 + 2 + SECURE_READ_RESPONSE_OVERHEAD + 8)) // 16
+
+
+def status_flag1_description(status_flag1: int) -> str:
+    """Describe status flag 1 of a card response.
+
+    A value other than 0x00 (normal completion) and 0xFF (the error is not
+    associated with a particular list entry) points at the service code list
+    or block list entry that failed. The specification defines two product
+    dependent encodings for that and the response carries no indication of
+    which one a card uses, so both readings are given: the byte may be the
+    1-based position in the list, or a bit map in which bit *n* (for *n* in
+    0..6) means the *(n+1)*-th or *(n+9)*-th entry and bit 7 the 8th entry.
+
+    """
+    if status_flag1 == 0x00:
+        return "normal completion"
+    if status_flag1 == 0xFF:
+        return "error not associated with a specific list entry"
+    positions = list()
+    for bit in range(8):
+        if status_flag1 & (1 << bit):
+            positions.append(bit + 1)
+            if bit <= 6:
+                positions.append(bit + 9)
+    return ("error at list position {0} (ordinal encoding) or {1} (bit "
+            "encoding)".format(status_flag1,
+                               "/".join(map(str, sorted(positions)))))
+
 
 class OptionVersion(TypedDict):
     major: int
@@ -108,6 +185,27 @@ NodeProperty = Union[
 ]
 
 
+def zeroize(*values: Optional[Octets]) -> None:
+    """Overwrite secret byte buffers in place.
+
+    Only a :class:`bytearray` can be cleared, anything else is ignored.
+    This bounds how long key material lives, it does not eliminate it:
+    Python copies freely and a :class:`bytes` object cannot be overwritten
+    at all, so every copy that was made before is untouched and the
+    interpreter may keep further copies out of reach. Swap and core dumps
+    still need handling at the operating system level.
+
+    """
+    for value in values:
+        if isinstance(value, bytearray):
+            for i in range(len(value)):
+                value[i] = 0
+
+
+def _redacted(value: Octets) -> str:
+    return "<{0} bytes redacted>".format(len(value))
+
+
 @dataclass
 class DesSecureSessionCredentials:
     session_key: Octets
@@ -117,8 +215,18 @@ class DesSecureSessionCredentials:
         if len(self.session_key) != 8:
             raise ValueError("session_key must be 8 bytes")
 
+    def __repr__(self) -> str:
+        # The session key must not reach a log; one debug log of a session
+        # object would otherwise write it into an application log file.
+        return "DesSecureSessionCredentials(session_key={0})".format(
+            _redacted(self.session_key))
+
     def clone(self) -> "DesSecureSessionCredentials":
         return DesSecureSessionCredentials(bytearray(self.session_key))
+
+    def zeroize(self) -> None:
+        """Overwrite the session key in place."""
+        zeroize(self.session_key)
 
 
 @dataclass
@@ -136,12 +244,24 @@ class Aes128SecureSessionCredentials:
         if len(self.challenge_3c) != 4:
             raise ValueError("challenge_3c must be 4 bytes")
 
+    def __repr__(self) -> str:
+        # The session keys must not reach a log. The challenge_3c value is
+        # sent by the card in the clear, so it stays visible for debugging.
+        return ("Aes128SecureSessionCredentials(encryption_key={0}, "
+                "mac_key={1}, challenge_3c={2})".format(
+                    _redacted(self.encryption_key), _redacted(self.mac_key),
+                    hexlify(self.challenge_3c).decode()))
+
     def clone(self) -> "Aes128SecureSessionCredentials":
         return Aes128SecureSessionCredentials(
             bytearray(self.encryption_key),
             bytearray(self.mac_key),
             bytearray(self.challenge_3c),
         )
+
+    def zeroize(self) -> None:
+        """Overwrite the session keys in place."""
+        zeroize(self.encryption_key, self.mac_key)
 
 
 SecureSessionCredentials = Union[
@@ -153,6 +273,21 @@ class AuthenticatedContext:
     transaction_number: int
     transaction_id: Octets
     credentials: SecureSessionCredentials
+    nodes: Sequence[int] = ()
+    """The addressable nodes of the session, in Authentication1 order.
+
+    A block list element names its target by position in this list, so
+    anything that has to identify a node of the live session, such as
+    :meth:`FelicaStandard.change_keys` naming the node whose key it
+    replaces, depends on the order being preserved. For DES this is the
+    *services* list of Authentication1, because the area list only scopes
+    the key chain and is not addressable; for v2 it is the node list.
+
+    A context built by hand, for instance by a relay that holds the keys,
+    should pass the same list it authenticated with. Leaving it empty only
+    means that node lookups fail, never that a wrong node is used.
+
+    """
 
     def __post_init__(self) -> None:
         if not isinstance(self.transaction_number, int):
@@ -162,6 +297,9 @@ class AuthenticatedContext:
         self.transaction_id = bytearray(self.transaction_id)
         if len(self.transaction_id) != 6:
             raise ValueError("transaction_id must be 6 bytes")
+        self.nodes = [int(node) for node in self.nodes]
+        if any(not 0 <= node <= 0xFFFF for node in self.nodes):
+            raise ValueError("node codes must be 16-bit integers")
         if isinstance(self.credentials, (
                 DesSecureSessionCredentials, Aes128SecureSessionCredentials)):
             return
@@ -174,6 +312,19 @@ class AuthenticatedContext:
             return "des"
         return "aes128"
 
+    def node_index(self, node: int) -> Optional[int]:
+        """Return the position of *node* in the session's node list.
+
+        This is what the service list index of a block list element
+        selects. :const:`None` is returned if the session was not opened
+        against that node.
+
+        """
+        try:
+            return list(self.nodes).index(int(node))
+        except ValueError:
+            return None
+
     def clone(self) -> "AuthenticatedContext":
         if isinstance(self.credentials, DesSecureSessionCredentials):
             credentials = self.credentials.clone()
@@ -183,6 +334,7 @@ class AuthenticatedContext:
             transaction_number=self.transaction_number,
             transaction_id=bytearray(self.transaction_id),
             credentials=credentials,
+            nodes=list(self.nodes),
         )
 
     def increment_transaction_number(self) -> None:
@@ -190,8 +342,18 @@ class AuthenticatedContext:
             raise ValueError("secure session transaction number overflow")
         self.transaction_number += 1
 
+    def zeroize(self) -> None:
+        """Overwrite the session keys in place.
+
+        The transaction number, the transaction ID and the node codes are
+        not secret and are left alone.
+
+        """
+        self.credentials.zeroize()
+
 
 class ChangeKeyParam(TypedDict):
+    node: int
     parent_key: Octets
     new_key: Octets
     old_key: Octets
@@ -317,7 +479,20 @@ class FelicaStandard(tt3.Type3Tag):
     MAX_SERVICE_CODES = 0x20
     MAX_NODE_CODES = 0x20
     MAX_NODE_PROPERTY_CODES = 0x10
-    MAX_BLOCK_LIST_LEN = 0xFF
+
+    # Largest block count a command or a response can state. This is the
+    # width of the block count field, not a limit on how many blocks a card
+    # accepts; the maximum is left to each product and every product is
+    # bounded by what a single 255 byte packet holds. A write is caught
+    # exactly by that packet limit when the frame is built, because its
+    # ceiling depends on whether the block list elements are two or three
+    # byte wide. A read must be checked separately, as it is bounded by its
+    # response while the command itself stays small.
+    MAX_BLOCK_COUNT = 0xFF
+    MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT = \
+        tt3.MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT
+    MAX_SECURE_READ_BLOCK_COUNT = _max_secure_read_block_count()
+    MAX_SECURE_READ_V2_BLOCK_COUNT = _max_secure_read_v2_block_count()
 
     TIMEOUT_UNIT = 302E-6
     MIN_TIMEOUT = 0.002
@@ -370,8 +545,9 @@ class FelicaStandard(tt3.Type3Tag):
     @staticmethod
     def _raise_status_flag_error(
             status_flag1: int, status_flag2: int) -> NoReturn:
-        log.debug("tag returned error status {0:02x}{1:02x}".format(
-            status_flag1, status_flag2))
+        log.debug("tag returned error status {0:02x}{1:02x} ({2})".format(
+            status_flag1, status_flag2,
+            status_flag1_description(status_flag1)))
         raise tt3.Type3TagCommandError(status_flag1 << 8 | status_flag2)
 
     @classmethod
@@ -382,13 +558,28 @@ class FelicaStandard(tt3.Type3Tag):
 
     @classmethod
     def _validate_status_flags(
-            cls, data: Octets, min_length: int = 2,
-            require_status_flag2_zero: bool = False) -> Tuple[int, int]:
+            cls, data: Octets, min_length: int = 2) -> Tuple[int, int]:
+        """Decide success or failure from a response's status flags.
+
+        Status flag 1 is the authority: 0x00 says that the card processed
+        the command normally and status flag 2 only details why a failure
+        happened. Status flag 2 must therefore not be second-guessed when
+        flag 1 reports normal completion. The memory rewrite count warning
+        (status flag 2 = 0x71) is raised *after* the write has been
+        performed and some products pair it with status flag 1 = 0x00;
+        rejecting such a response would report a completed write as a
+        failure and invite the caller to retry it. A non-zero flag 2 is
+        logged so that the warning is not silently dropped.
+
+        """
         status_flag1, status_flag2 = cls._parse_status_flags(
             data, min_length=min_length)
-        if status_flag1 != 0 or (require_status_flag2_zero
-                                 and status_flag2 != 0):
+        if status_flag1 != 0:
             cls._raise_status_flag_error(status_flag1, status_flag2)
+        if status_flag2 != 0:
+            log.warning(
+                "command completed normally but reported status flag 2 "
+                "{0:02x}".format(status_flag2))
         return status_flag1, status_flag2
 
     @staticmethod
@@ -753,34 +944,40 @@ class FelicaStandard(tt3.Type3Tag):
         transaction_id = command_context.transaction_id
         credentials = command_context.credentials
 
-        if isinstance(credentials, DesSecureSessionCredentials):
-            secure_payload = bytearray(pack("<H", transaction_number)) \
-                + transaction_id + bytearray(command_payload)
-            encrypted_command = self._encrypt_secure_command_des(
-                command_code, secure_payload, credentials.session_key)
-        elif isinstance(credentials, Aes128SecureSessionCredentials):
-            encrypted_command = self._encrypt_secure_request_v2_aes128(
-                command_code, transaction_number, transaction_id,
-                credentials.challenge_3c, credentials.encryption_key,
-                credentials.mac_key, bytearray(command_payload))
-        else:
-            self._raise_protocol_error("unknown secure session scheme")
+        try:
+            if isinstance(credentials, DesSecureSessionCredentials):
+                secure_payload = bytearray(pack("<H", transaction_number)) \
+                    + transaction_id + bytearray(command_payload)
+                encrypted_command = self._encrypt_secure_command_des(
+                    command_code, secure_payload, credentials.session_key)
+            elif isinstance(credentials, Aes128SecureSessionCredentials):
+                encrypted_command = self._encrypt_secure_request_v2_aes128(
+                    command_code, transaction_number, transaction_id,
+                    credentials.challenge_3c, credentials.encryption_key,
+                    credentials.mac_key, bytearray(command_payload))
+            else:
+                self._raise_protocol_error("unknown secure session scheme")
 
-        encrypted_response = self._send_without_response_idm(
-            command_code, encrypted_command, timeout)
-        response_code = (command_code + 1) & 0xFF
+            encrypted_response = self._send_without_response_idm(
+                command_code, encrypted_command, timeout)
+            response_code = (command_code + 1) & 0xFF
 
-        if isinstance(credentials, DesSecureSessionCredentials):
-            rsp_tn, response_payload = self._decrypt_secure_response_des(
-                response_code, transaction_id, credentials.session_key,
-                encrypted_response)
-        elif isinstance(credentials, Aes128SecureSessionCredentials):
-            rsp_tn, response_payload = self._decrypt_secure_response_v2_aes128(
-                response_code, transaction_id, credentials.challenge_3c,
-                credentials.encryption_key, credentials.mac_key,
-                encrypted_response)
-        else:
-            self._raise_protocol_error("unknown secure session scheme")
+            if isinstance(credentials, DesSecureSessionCredentials):
+                rsp_tn, response_payload = self._decrypt_secure_response_des(
+                    response_code, transaction_id, credentials.session_key,
+                    encrypted_response)
+            elif isinstance(credentials, Aes128SecureSessionCredentials):
+                rsp_tn, response_payload = \
+                    self._decrypt_secure_response_v2_aes128(
+                        response_code, transaction_id,
+                        credentials.challenge_3c, credentials.encryption_key,
+                        credentials.mac_key, encrypted_response)
+            else:
+                self._raise_protocol_error("unknown secure session scheme")
+        finally:
+            # This context is a copy of the session made for one command,
+            # so its keys are overwritten as soon as the exchange is over.
+            command_context.zeroize()
 
         context = self._ensure_authenticated_context()
         if rsp_tn <= context.transaction_number:
@@ -846,6 +1043,7 @@ class FelicaStandard(tt3.Type3Tag):
             # and reads all block data if there is one service that
             # does not require a key. First we figure out the common
             # service type and which access modes are available.
+            service_type = access_types = None
             if services[0] >> 2 & 0b1111 == 0b0010:
                 service_type = "Random"
                 access_types = " & ".join([(
@@ -863,6 +1061,12 @@ class FelicaStandard(tt3.Type3Tag):
                     "cashback with key", "cashback w/o key",
                     "decrement with key", "decrement w/o key",
                     "read with key", "read w/o key")[x & 7] for x in services])
+            if service_type is None:
+                # The service attribute table leaves other values
+                # undefined, so there is nothing to describe beyond the
+                # attribute bits themselves.
+                service_type = "Type {0:06b}b".format(services[0] & 0b111111)
+                access_types = "unknown access"
             # Now we print one line to verbosely describe the service
             # and list the service codes.
             service_codes = " ".join(["0x{0:04X}".format(x) for x in services])
@@ -972,6 +1176,11 @@ class FelicaStandard(tt3.Type3Tag):
         16-bit integers, in the order requested. If a specified
         service (or area) does not exist, the key version will be
         0xFFFF.
+
+        0xFFFF is the marker for a node that does not exist, not a
+        marker for a service that needs no authentication: a service
+        whose attribute requires no key reports a genuine key version
+        like any other node.
 
         Command execution errors raise :exc:`~nfc.tag.TagCommandError`.
 
@@ -1201,10 +1410,7 @@ class FelicaStandard(tt3.Type3Tag):
         data = self._send_standard_command(
             self.SET_PARAMETER_CMD, data, timeout)
         self._validate_exact_length(data, 2)
-
-        status_flag1, status_flag2 = data[0], data[1]
-        if status_flag1 != 0 or status_flag2 != 0:
-            self._raise_status_flag_error(status_flag1, status_flag2)
+        self._validate_status_flags(data)
 
     def get_container_issue_information(self) -> Dict[str, bytearray]:
         """Return container issue information.
@@ -1340,10 +1546,7 @@ class FelicaStandard(tt3.Type3Tag):
         data = self._send_standard_command(
             self.RESET_MODE_CMD, b'\x00\x00', timeout)
         self._validate_exact_length(data, 2)
-
-        status_flag1, status_flag2 = data[0], data[1]
-        if status_flag1 != 0 or status_flag2 != 0:
-            self._raise_status_flag_error(status_flag1, status_flag2)
+        self._validate_status_flags(data)
 
     def get_area_information(self, node_code: int) -> Tuple[int, bytearray]:
         """Return information of an area node code.
@@ -1536,7 +1739,15 @@ class FelicaStandard(tt3.Type3Tag):
             self._normalize_authenticated_context(context)
 
     def clear_authenticated_context(self) -> None:
-        """Clear secure session context."""
+        """Clear secure session context.
+
+        The session keys are overwritten in place before the context is
+        dropped, so that they do not linger in a buffer that is only
+        waiting to be garbage collected.
+
+        """
+        if self._authenticated_context is not None:
+            self._authenticated_context.zeroize()
         self._authenticated_context = None
 
     def authenticated_scheme(self) -> Optional[SecureSessionScheme]:
@@ -1554,6 +1765,12 @@ class FelicaStandard(tt3.Type3Tag):
         The *services* argument is a list of
         :class:`~nfc.tag.tt3.ServiceCode` objects.
         The *challenge_1a* argument must be 8 bytes.
+
+        The service code list is not restricted to services. It may
+        equally name an area or the system node 0xFFFF, and the card
+        folds that node's key into the derivation chain; both count as
+        authentication-required nodes, which the card requires to come
+        before any authentication-free service in the list.
 
         Returns a tuple ``(challenge_1b, challenge_2a)``.
 
@@ -1657,7 +1874,17 @@ class FelicaStandard(tt3.Type3Tag):
             transaction_number=transaction_number,
             transaction_id=transaction_id,
             credentials=DesSecureSessionCredentials(random_2),
+            # A block list element's service list index counts the service
+            # list only; the area list scopes the key chain and is not
+            # addressable. A node whose key is to be changed therefore has
+            # to be named among the services, which the system node 0xFFFF
+            # may be.
+            nodes=[int(service) for service in services],
         )
+        # The session key now lives in the context, which clears it when the
+        # session ends. These are the copies this exchange made.
+        zeroize(random_1, random_2, challenge_1a, challenge_2b, payload,
+                key_l, alpha, beta)
         return issue_id, issue_parameter
 
     @staticmethod
@@ -1690,8 +1917,13 @@ class FelicaStandard(tt3.Type3Tag):
     def _secure_read(
             self, command_code: int,
             block_list: Sequence[tt3.BlockCode]) -> List[bytearray]:
-        self._validate_list_length(
-            "block_list", len(block_list), 1, self.MAX_BLOCK_LIST_LEN)
+        # Like Read Without Encryption, a secure read is bounded by its
+        # response rather than its command; the DES scheme's padding costs
+        # it one block against Read v2.
+        maximum = (self.MAX_SECURE_READ_V2_BLOCK_COUNT
+                   if command_code == self.READ_V2_CMD
+                   else self.MAX_SECURE_READ_BLOCK_COUNT)
+        self._validate_list_length("block_list", len(block_list), 1, maximum)
         timeout = self._scaled_timeout(
             self.READ_PMMSLOT, len(block_list), enforce_min=True)
         payload = self._build_block_command_payload(block_list)
@@ -1709,8 +1941,12 @@ class FelicaStandard(tt3.Type3Tag):
     def _secure_write(
             self, command_code: int, block_list: Sequence[tt3.BlockCode],
             data: Octets) -> None:
+        # A write's true ceiling depends on whether its block list elements
+        # are two or three byte wide, so there is no single count to check
+        # here; the 255 byte packet limit is enforced exactly when the frame
+        # is built.
         self._validate_list_length(
-            "block_list", len(block_list), 1, self.MAX_BLOCK_LIST_LEN)
+            "block_list", len(block_list), 1, self.MAX_BLOCK_COUNT)
         if len(data) != len(block_list) * 16:
             raise ValueError("data length must be 16 * len(block_list)")
         timeout = self._scaled_timeout(
@@ -1720,7 +1956,7 @@ class FelicaStandard(tt3.Type3Tag):
         # A DES secure response is CBC encrypted and therefore padded to a
         # multiple of 8 byte, so only the leading status flags are fixed.
         self._validate_min_length(rsp, 2)
-        self._validate_status_flags(rsp, require_status_flag2_zero=True)
+        self._validate_status_flags(rsp)
 
     def write(self, block_list: Sequence[tt3.BlockCode], data: Octets) -> None:
         """Write data blocks with secure messaging."""
@@ -1732,23 +1968,51 @@ class FelicaStandard(tt3.Type3Tag):
         self._secure_write(self.WRITE_V2_CMD, block_list, data)
 
     def change_keys(self, change_key_params: Sequence[ChangeKeyParam]) -> None:
-        """Change service keys through secure Write command.
+        """Change node keys through secure Write command.
 
-        Each entry in *change_key_params* must provide the keys
-        ``parent_key``, ``new_key``, ``old_key``, and ``new_key_version``.
+        Each entry in *change_key_params* must provide the ``node`` whose
+        key is replaced, the keys ``parent_key``, ``new_key``, ``old_key``,
+        and the ``new_key_version``.
+
+        A block list element names its target by position in the node list
+        the session was authenticated against, so a key can only be changed
+        for a node that list contains. Resolving the position here, rather
+        than assuming one, is what keeps a mistyped node from silently
+        rewriting a different node's key. The system node ``0xFFFF`` is
+        addressable like any other node when it was named among the
+        services of :meth:`mutual_authentication`.
 
         """
         if len(change_key_params) == 0:
             raise ValueError("change_keys requires at least one entry")
+        for params in change_key_params:
+            if any(len(params[name]) != 8 for name in (
+                    "parent_key", "new_key", "old_key")):
+                raise ValueError("all key values must be 8 bytes")
+
+        context = self._ensure_authenticated_context()
         block_list = list()
         payload = bytearray()
         for params in change_key_params:
+            node = params["node"]
             parent_key = params["parent_key"]
             new_key = params["new_key"]
             old_key = params["old_key"]
             new_key_version = params["new_key_version"]
-            if len(parent_key) != 8 or len(new_key) != 8 or len(old_key) != 8:
-                raise ValueError("all key values must be 8 bytes")
+
+            index = context.node_index(node)
+            if index is None:
+                raise ValueError(
+                    "node {0:#06x} is not in the authenticated node list {1}"
+                    .format(node, ["{0:#06x}".format(listed)
+                                   for listed in context.nodes]))
+            if index > 0x0F:
+                # The service list index of a block list element is four
+                # bits wide.
+                raise ValueError(
+                    "node {0:#06x} is at position {1} of the authenticated "
+                    "node list, which a block list element cannot address"
+                    .format(node, index))
 
             version_block = bytearray(8)
             version_block[6:8] = pack("<H", new_key_version)
@@ -1763,7 +2027,7 @@ class FelicaStandard(tt3.Type3Tag):
             payload.extend(parameter1)
             payload.extend(parameter2)
             block_list.append(
-                tt3.BlockCode(new_key_version, access=4, service=0))
+                tt3.BlockCode(new_key_version, access=4, service=index))
 
         self.write(block_list, payload)
 
@@ -1874,7 +2138,13 @@ class FelicaStandard(tt3.Type3Tag):
                 mac_key=mac_key,
                 challenge_3c=challenge_3c,
             ),
+            nodes=[int(node) for node in nodes],
         )
+        # The derived session keys now live in the context, which clears
+        # them when the session ends. These are the copies this exchange
+        # made.
+        zeroize(random_1, random_2, challenge_1a, challenge_2b, payload,
+                encryption_key, mac_key, h, alpha, beta, beta_with_3c)
         return issue_id, issue_parameter
 
     def _generate_registration_package_des(
@@ -1943,7 +2213,7 @@ class FelicaStandard(tt3.Type3Tag):
         payload = bytearray(pack("<H", area_code)) + package
         data = self._secure_command_exchange(
             self.REGISTER_AREA_CMD, payload, timeout)
-        self._validate_status_flags(data, require_status_flag2_zero=True)
+        self._validate_status_flags(data)
 
     def register_service(
             self, service_code: int, size: int, key_version: int,
@@ -1978,7 +2248,7 @@ class FelicaStandard(tt3.Type3Tag):
             self.REGISTRATION_PMMSLOT, enforce_min=True)
         data = self._secure_command_exchange(
             self.CHANGE_SYSTEM_BLOCK_CMD, b'', timeout)
-        self._validate_status_flags(data, require_status_flag2_zero=True)
+        self._validate_status_flags(data)
 
 
 class FelicaMobile(FelicaStandard):

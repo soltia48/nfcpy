@@ -837,10 +837,17 @@ class TestFelicaStandardCommands:
 
     def test_set_parameter_rejected(self, tag):
         tag.clf.exchange.return_value = \
-            HEX('0c 21 0102030405060708 00b2')
+            HEX('0c 21 0102030405060708 ffb2')
         with pytest.raises(nfc.tag.tt3.Type3TagCommandError) as excinfo:
             tag.set_parameter(1, 0)
-        assert excinfo.value.errno == 0x00B2
+        assert excinfo.value.errno == 0xFFB2
+
+    def test_set_parameter_status_flag2_warning(self, tag):
+        # Status flag 1 is the sole authority on success, so a warning in
+        # status flag 2 does not turn a completed command into a failure.
+        tag.clf.exchange.return_value = \
+            HEX('0c 21 0102030405060708 0071')
+        assert tag.set_parameter(1, 0) is None
 
     def test_get_container_issue_information(self, tag):
         cmd = HEX('0c 22 0102030405060708 0000')
@@ -1031,12 +1038,47 @@ class TestFelicaStandardCommands:
         with pytest.raises(ValueError) as excinfo:
             tag.read(block_list)
         assert str(excinfo.value) == \
-            "block_list must contain between 1 and 255 entries"
+            "block_list must contain between 1 and 14 entries"
         with pytest.raises(ValueError) as excinfo:
             tag.write(block_list, bytearray(16 * count))
         assert str(excinfo.value) == \
             "block_list must contain between 1 and 255 entries"
         assert tag.clf.exchange.mock_calls == []
+
+    def test_secure_read_block_count_limits(self, tag):
+        # A secure read is bounded by its response, and the DES scheme
+        # loses one block to the PKCS#7 padding its response carries.
+        assert nfc.tag.tt3_sony.FelicaStandard \
+            .MAX_SECURE_READ_BLOCK_COUNT == 14
+        assert nfc.tag.tt3_sony.FelicaStandard \
+            .MAX_SECURE_READ_V2_BLOCK_COUNT == 15
+
+        self.des_authenticate(tag)
+        reset_exchange(tag)
+        with pytest.raises(ValueError) as excinfo:
+            tag.read([nfc.tag.tt3.BlockCode(0)] * 15)
+        assert str(excinfo.value) == \
+            "block_list must contain between 1 and 14 entries"
+        with pytest.raises(ValueError) as excinfo:
+            tag.read_v2([nfc.tag.tt3.BlockCode(0)] * 16)
+        assert str(excinfo.value) == \
+            "block_list must contain between 1 and 15 entries"
+        assert tag.clf.exchange.mock_calls == []
+
+    def test_secure_read_block_count_limits_fit_a_packet(self, tag):
+        # The limits are what a 255 byte response packet holds, so the
+        # maximum block count must frame and one more must not.
+        for blocks, padded in ((14, True), (15, False)):
+            # LEN + response code + E(txn + txid + SF1 + SF2 + n + 16n)
+            # padded to whole DES blocks + MAC
+            payload = 2 + 6 + 3 + blocks * 16
+            length = 2 + (payload // 8 + 1) * 8 + 8
+            assert (length <= 255) is padded
+
+        for blocks, fits in ((15, True), (16, False)):
+            # LEN + response code + counter + SF1 + SF2 + n + 16n + MAC
+            length = 2 + 2 + 3 + blocks * 16 + 8
+            assert (length <= 255) is fits
 
     def test_authentication1_too_many_nodes(self, tag):
         with pytest.raises(ValueError) as excinfo:
@@ -1183,6 +1225,61 @@ class TestFelicaStandardCommands:
             context.increment_transaction_number()
         assert str(excinfo.value) == \
             "secure session transaction number overflow"
+
+    def test_session_repr_never_contains_key_material(self):
+        # One debug log of a session object would otherwise write the live
+        # session key into an application log file.
+        des = nfc.tag.tt3_sony.DesSecureSessionCredentials(
+            HEX('deadbeefdeadbeef'))
+        assert repr(des) == \
+            "DesSecureSessionCredentials(session_key=<8 bytes redacted>)"
+
+        aes = nfc.tag.tt3_sony.Aes128SecureSessionCredentials(
+            encryption_key=bytearray(16 * [0xA1]),
+            mac_key=bytearray(16 * [0xB2]),
+            challenge_3c=HEX('01020304'))
+        text = repr(aes)
+        assert text.count("<16 bytes redacted>") == 2
+        assert "a1a1" not in text and "b2b2" not in text
+        # challenge_3c travels in the clear, so it stays visible
+        assert "challenge_3c=01020304" in text
+
+        context = nfc.tag.tt3_sony.AuthenticatedContext(
+            transaction_number=7, transaction_id=HEX('020304050607'),
+            credentials=des, nodes=[0x0009])
+        text = repr(context)
+        assert "transaction_number=7" in text
+        assert "<8 bytes redacted>" in text
+        assert "deadbeef" not in text
+
+    def test_clear_authenticated_context_zeroizes_the_session_key(self, tag):
+        credentials = nfc.tag.tt3_sony.DesSecureSessionCredentials(
+            HEX('a0a1a2a3a4a5a6a7'))
+        tag.set_authenticated_context(nfc.tag.tt3_sony.AuthenticatedContext(
+            transaction_number=3, transaction_id=HEX('020304050607'),
+            credentials=credentials))
+        # the context is normalized into the tag, so reach for that copy
+        stored = tag._authenticated_context
+        assert stored.credentials.session_key == HEX('a0a1a2a3a4a5a6a7')
+        tag.clear_authenticated_context()
+        assert stored.credentials.session_key == bytearray(8)
+        assert tag.authenticated_context() is None
+
+    @pytest.mark.parametrize("status_flag1, expected", [
+        (0x00, "normal completion"),
+        (0xFF, "error not associated with a specific list entry"),
+        # the 10th list entry is 0x0A in the ordinal encoding and 0x02 in
+        # the bit encoding, which cannot tell entry 2 from entry 10
+        (0x0A, "error at list position 10 (ordinal encoding) or 2/4/10/12 "
+               "(bit encoding)"),
+        (0x02, "error at list position 2 (ordinal encoding) or 2/10 "
+               "(bit encoding)"),
+        (0x80, "error at list position 128 (ordinal encoding) or 8 "
+               "(bit encoding)"),
+    ])
+    def test_status_flag1_description(self, status_flag1, expected):
+        assert nfc.tag.tt3_sony.status_flag1_description(status_flag1) \
+            == expected
 
     #
     # DES mutual authentication and secure messaging
@@ -1377,6 +1474,29 @@ class TestFelicaStandardCommands:
         tag.clf.exchange.assert_called_once_with(
             bytearray([len(command) + 2, 0x16]) + command, STD_TIMEOUT_1)
 
+    def test_secure_write_memory_rewrite_count_warning(self, tag):
+        # Status flag 2 = 0x71 (memory rewrite count exceeded) is a warning
+        # raised after the write has been performed, and some products pair
+        # it with status flag 1 = 0x00. Such a response reports a completed
+        # write and must not surface as an error, because the caller would
+        # otherwise retry a write that already happened.
+        self.des_authenticate(tag)
+        reset_exchange(tag)
+
+        block_data = bytearray(range(16))
+        response = des_secure_packet(
+            0x17, 3, HEX('020304050607'), HEX('0071'), self.RANDOM_2)
+        tag.clf.exchange.return_value = \
+            bytearray([len(response) + 2, 0x17]) + response
+        assert tag.write([nfc.tag.tt3.BlockCode(0)], block_data) is None
+
+    def test_mutual_authentication_records_the_service_list(self, tag):
+        # The session records the services it was opened against, because a
+        # block list element names its target by position in that list. The
+        # area list only scopes the key chain and is not addressable.
+        self.des_authenticate(tag)
+        assert tag.authenticated_context().nodes == [0x0009]
+
     #
     # AES-128 (v2) mutual authentication and secure messaging
     #
@@ -1442,6 +1562,8 @@ class TestFelicaStandardCommands:
         assert context.credentials.encryption_key == encryption_key
         assert context.credentials.mac_key == mac_key
         assert context.credentials.challenge_3c == self.CHALLENGE_3C
+        # a v2 session records the node list it was opened against
+        assert context.nodes == [0x1008]
 
     def test_mutual_authentication_v2_wrong_key(self, tag):
         tag.clf.exchange.side_effect = [
@@ -1696,6 +1818,7 @@ class TestFelicaStandardCommands:
         tag.clf.exchange.return_value = \
             bytearray([len(response) + 2, 0x17]) + response
         assert tag.change_keys([{
+            "node": 0x0009,
             "parent_key": parent_key,
             "new_key": new_key,
             "old_key": old_key,
@@ -1703,6 +1826,84 @@ class TestFelicaStandardCommands:
         }]) is None
         tag.clf.exchange.assert_called_once_with(
             bytearray([len(command) + 2, 0x16]) + command, STD_TIMEOUT_1)
+
+    def test_change_keys_addresses_the_named_node(self, tag):
+        """The block list element points at the node's list position."""
+        self.des_authenticate(tag)
+        reset_exchange(tag)
+        # a session opened against two services, the second one is 0xFFFF
+        context = tag.authenticated_context()
+        context.nodes = [0x0009, 0xFFFF]
+        tag.set_authenticated_context(context)
+
+        parent_key = HEX('4041424344454647')
+        new_key = HEX('5051525354555657')
+        old_key = HEX('6061626364656667')
+        version_block = bytearray(8)
+        version_block[6:8] = struct.pack("<H", 3)
+        parameter1 = des_ecb_encrypt(
+            des_ecb_encrypt(
+                des_ecb_encrypt(version_block, new_key), old_key), parent_key)
+        parameter2 = des_ecb_encrypt(
+            des_ecb_encrypt(new_key, old_key), parent_key)
+        # the system node sits at position 1 of the node list
+        command = des_secure_packet(
+            0x16, 2, HEX('020304050607'),
+            HEX('01') + nfc.tag.tt3.BlockCode(3, access=4, service=1).pack()
+            + parameter1 + parameter2, self.RANDOM_2)
+        response = des_secure_packet(
+            0x17, 3, HEX('020304050607'), HEX('0000'), self.RANDOM_2)
+
+        tag.clf.exchange.return_value = \
+            bytearray([len(response) + 2, 0x17]) + response
+        assert tag.change_keys([{
+            "node": 0xFFFF,
+            "parent_key": parent_key,
+            "new_key": new_key,
+            "old_key": old_key,
+            "new_key_version": 3,
+        }]) is None
+        tag.clf.exchange.assert_called_once_with(
+            bytearray([len(command) + 2, 0x16]) + command, STD_TIMEOUT_1)
+
+    def test_change_keys_rejects_node_outside_session(self, tag):
+        # A key change names its node by position in the list the session
+        # was opened against, so a node that list does not contain has no
+        # position to use. Sending it anyway would rewrite the key of
+        # whichever node does sit at the position.
+        self.des_authenticate(tag)
+        reset_exchange(tag)
+        with pytest.raises(ValueError) as excinfo:
+            tag.change_keys([{
+                "node": 0x1008,
+                "parent_key": HEX('4041424344454647'),
+                "new_key": HEX('5051525354555657'),
+                "old_key": HEX('6061626364656667'),
+                "new_key_version": 2,
+            }])
+        assert str(excinfo.value) == \
+            "node 0x1008 is not in the authenticated node list ['0x0009']"
+        assert tag.clf.exchange.mock_calls == []
+
+    def test_change_keys_rejects_unaddressable_node_position(self, tag):
+        # The service list index of a block list element is four bits wide.
+        self.des_authenticate(tag)
+        reset_exchange(tag)
+        context = tag.authenticated_context()
+        context.nodes = list(range(0x1000, 0x1011))
+        tag.set_authenticated_context(context)
+        with pytest.raises(ValueError) as excinfo:
+            tag.change_keys([{
+                "node": 0x1010,
+                "parent_key": HEX('4041424344454647'),
+                "new_key": HEX('5051525354555657'),
+                "old_key": HEX('6061626364656667'),
+                "new_key_version": 2,
+            }])
+        assert str(excinfo.value) == (
+            "node 0x1010 is at position 16 of the authenticated node list, "
+            "which a block list element cannot address")
+        assert tag.clf.exchange.mock_calls == []
 
     def test_register_issue_id_wrong_key_size(self, tag):
         with pytest.raises(ValueError) as excinfo:
@@ -1728,6 +1929,7 @@ class TestFelicaStandardCommands:
     def test_change_keys_wrong_key_size(self, tag):
         with pytest.raises(ValueError) as excinfo:
             tag.change_keys([{
+                "node": 0x0009,
                 "parent_key": HEX('4041424344454647'),
                 "new_key": HEX('50515253545556'),
                 "old_key": HEX('6061626364656667'),

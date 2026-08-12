@@ -344,6 +344,29 @@ class TestType3Tag:
                       0.46402560000000004),
         ]
 
+    def test_read_without_encryption_block_count_limit(self, tag):
+        # A read is bounded by its response: 16 byte per block on top of a
+        # fixed 13 byte header, against the 255 byte packet limit.
+        assert nfc.tag.tt3.MAX_READ_WITHOUT_ENCRYPTION_BLOCK_COUNT == 15
+        sc_list = [nfc.tag.tt3.ServiceCode(0, 11)]
+        bc_list = [nfc.tag.tt3.BlockCode(n) for n in range(16)]
+        with pytest.raises(ValueError) as excinfo:
+            tag.read_without_encryption(sc_list, bc_list)
+        assert str(excinfo.value) == \
+            "a Read Without Encryption response holds at most 15 blocks"
+        assert tag.clf.exchange.called is False
+
+    def test_send_cmd_recv_rsp_packet_length_limit(self, tag):
+        # The one byte data length field carries the packet data length
+        # plus one, so a longer packet cannot be announced at all.
+        assert nfc.tag.tt3.MAX_PACKET_LEN == 255
+        with pytest.raises(ValueError) as excinfo:
+            tag.send_cmd_recv_rsp(0xF0, bytearray(246), 0.1)
+        assert str(excinfo.value) == (
+            "command packet would be 256 byte, but the one byte data length "
+            "field caps a packet at 255 byte")
+        assert tag.clf.exchange.called is False
+
     def test_read_from_ndef_service(self, tag):
         data = HEX(
             "10 01 01 00  01 00 00 00  00 00 00 00  00 10 00 23"

@@ -65,6 +65,45 @@ before 3.8.
 * The list arguments of the FeliCa Standard commands are checked against
   the limits of the specification before a command frame is built.
 
+* A command packet is rejected when it would exceed the 255 byte that
+  the one byte data length field can announce. A wrapped around length
+  byte would have put a frame on the air that no card can answer. The
+  block count of a read is checked against what a single response packet
+  holds, which is 15 blocks for Read Without Encryption and Read v2 and
+  14 for the DES Read, because a read is bounded by its response while
+  its command stays small.
+
+* Bugfix: Status flag 2 no longer overrules status flag 1. Status flag 1
+  is the sole authority on whether a command completed, and a non-zero
+  status flag 2 alongside a normal completion is logged as a warning.
+  The memory rewrite count warning `0x71` is raised after the write has
+  been performed and some products pair it with status flag 1 `0x00`, so
+  `write`, `write_v2`, `set_parameter`, `reset_mode`, `register_area`
+  and `change_system_block` reported a completed command as a failure.
+
+* `change_keys` now takes the `node` whose key it replaces in each
+  entry, and resolves it to a position in the node list the session was
+  authenticated against. Previously every key change addressed the first
+  node of that list, so changing the key of any other node silently
+  rewrote the wrong node's key. A node the session does not cover raises
+  `ValueError`.
+
+* An `AuthenticatedContext` records the node list its session was opened
+  against, since a block list element names its target by position in
+  that list.
+
+* Security: Session keys no longer reach a log. The secure session
+  credentials and the authenticated context print the length of a key
+  instead of its bytes, and the nonces, challenges and derived keys of
+  both mutual authentications are overwritten once the session holds
+  them. `clear_authenticated_context` overwrites the session keys before
+  dropping the context.
+
+* The FeliCa card start-up time before the first polling command is
+  raised from 5 ms to the recommended 20.4 ms. A card needs up to 20 ms
+  from entering the field to being able to receive a command, so a
+  reader that polls once could miss it.
+
 * A new documentation chapter describes the FeliCa Standard commands,
   key derivation, secure messaging and issuance.
 
